@@ -1,2 +1,3 @@
 workspace/*
 ASRepCatcher/__pycache__/*
+ASRepCatcher/ASRepCatcher.py

