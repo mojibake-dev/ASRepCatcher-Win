@@ -1,15 +1,19 @@
-# ASRepCatcher-Win - Windows Port```bash
-# Not yet functional on Windows
-python ASRepCatcher/ASRepCatcher-WIN.py relay -dc 192.168.1.100
-```
+# ASRepCatcher-Win - Windows Port
 
-### Listen (Fully Working)
+
+### Listen 
 
 In listen mode, the ARP cache of the gateway is poisoned in order to receive the AS-REP responses destined to the clients.
 This is a passive mode with no alteration of packets in transit.
 
 ```bash
-python ASRepCatcher/ASRepCatcher-WIN.py listen
+python ASRepCatcher/ASRepCatcher-WIN.py listen -targets <ONE OR MORE IPS> -dc <IP>
+```
+
+### Relay
+
+```bash
+python ASRepCatcher/ASRepCatcher-WIN.py relay -dc 192.168.1.100
 ```
 
 **Bonus**: The tool catches usernames in Kerberos responses to provide more domain intelligence.
@@ -53,7 +57,7 @@ ASRepCatcher uses ARP spoofing to catch AS-REP messages returned by the Domain C
 ### Testing Status
 **Limited Lab Testing**: This Windows port has only been tested in a controlled lab environment with:
 - 1 Domain Controller (Windows Server)
-- 1 Target workstation 
+- 1 Target workstation (Windows)
 - 1 Attacker machine (Windows)
 - Users with pre-authentication disabled
 
@@ -67,15 +71,14 @@ ASRepCatcher uses ARP spoofing to catch AS-REP messages returned by the Domain C
 
 ## Two Modes
 
-### Relay (Under Development)
-
-**Note**: Relay mode is not yet working in the Windows port. This is planned for future development.
+### Relay
 
 In relay mode (Linux original), the Kerberos TGT requests (AS-REQ) coming from workstations are relayed to the DC. If RC4 is allowed, the clients are forced to use it.
 
 ```bash
 ASRepCatcher relay -dc 192.168.1.100
 ```
+
 ### Listen
 
 In listen mode, the ARP cache of the gateway is poisoned in order to receive the AS-REP responses destined to the clients.
