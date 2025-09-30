@@ -35,17 +35,9 @@ import atexit
 from datetime import datetime
 import struct
 
-# Rich library imports for enhanced formatting
+# Rich library imports for enhanced formatting (scrolling output only)
 from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.columns import Columns
-from rich.live import Live
 from rich.text import Text
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
-from rich.layout import Layout
-from rich.align import Align
-from rich import box
 
 import time
 import struct
@@ -55,10 +47,8 @@ decoder = asn1.Decoder()
 stop_arp_spoofing_flag = threading.Event()
 cleanup_performed = False  # Flag to prevent multiple cleanup calls
 
-# Rich display management
+# Rich display management (simplified)
 console = Console()
-live_display = None
-setup_complete = False
 
 # Global variables that will be set in main()
 mode = None
@@ -83,13 +73,13 @@ original_ip_forward = None
 relay_port = 88
 skip_redirection = False
 
-# Debug message scroll for live display
+# Debug message scroll (simplified)
 debug_messages = []
 MAX_DEBUG_MESSAGES = 10
 
 
 # =======================================
-# RICH DISPLAY MANAGEMENT
+# LOGGING FUNCTIONS (with Rich formatting)
 # =======================================
 
 def add_debug_message(message):
@@ -98,140 +88,6 @@ def add_debug_message(message):
     debug_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
     if len(debug_messages) > MAX_DEBUG_MESSAGES:
         debug_messages.pop(0)
-    update_live_display()
-
-def create_setup_panel():
-    """Create a setup information panel"""
-    setup_info = []
-    setup_info.append(f"[cyan]Mode:[/cyan] {mode}")
-    setup_info.append(f"[cyan]Interface:[/cyan] {iface}")
-    setup_info.append(f"[cyan]Gateway:[/cyan] {gw}")
-    if dc:
-        setup_info.append(f"[cyan]Domain Controller:[/cyan] {dc}")
-    setup_info.append(f"[cyan]Output File:[/cyan] {outfile}")
-    setup_info.append(f"[cyan]Users File:[/cyan] {usersfile}")
-    if not disable_spoofing:
-        setup_info.append(f"[cyan]ARP Spoofing:[/cyan] [green]Enabled[/green]")
-        setup_info.append(f"[cyan]Targets:[/cyan] {len(TargetsList) if TargetsList else 0} hosts")
-    else:
-        setup_info.append(f"[cyan]ARP Spoofing:[/cyan] [red]Disabled[/red]")
-    
-    panel = Panel(
-        "\n".join(setup_info),
-        title="[bold blue]ASRepCatcher-WIN Configuration[/bold blue]",
-        border_style="blue",
-        box=box.ROUNDED
-    )
-    return panel
-
-def create_arp_status_table():
-    """Create ARP spoofing status table"""
-    table = Table(title="ARP Spoofing Status", box=box.ROUNDED, show_header=True, header_style="bold magenta")
-    table.add_column("Status", style="cyan", no_wrap=True)
-    table.add_column("Targets", style="green", no_wrap=True)
-    table.add_column("Active", style="yellow", no_wrap=True)
-    table.add_column("Packets Sent", style="blue", no_wrap=True)
-    
-    if disable_spoofing:
-        table.add_row("[red]Disabled[/red]", "N/A", "N/A", "N/A")
-    else:
-        target_count = len(Targets) if Targets else 0
-        initial_count = len(InitialTargets) if InitialTargets else 0
-        active_targets = len([t for t in (Targets if Targets else []) if t])
-        
-        status = "[green]Active[/green]" if target_count > 0 else "[yellow]Waiting[/yellow]"
-        table.add_row(status, f"{initial_count}", f"{active_targets}", "Continuous")
-    
-    return table
-
-def create_hash_capture_table():
-    """Create hash capture results table"""
-    table = Table(title="Captured Hashes", box=box.ROUNDED, show_header=True, header_style="bold green")
-    table.add_column("Username", style="cyan", no_wrap=True)
-    table.add_column("Domain", style="magenta", no_wrap=True)
-    table.add_column("Encryption Type", style="yellow", no_wrap=True)
-    table.add_column("Status", style="green", no_wrap=True)
-    table.add_column("Time", style="blue", no_wrap=True)
-    
-    if not UsernamesCaptured:
-        table.add_row("[dim]No hashes captured yet[/dim]", "", "", "", "")
-    else:
-        for username, etypes in UsernamesCaptured.items():
-            for etype in etypes:
-                time_str = time.strftime("%H:%M:%S")
-                table.add_row(username, "[dim]domain[/dim]", str(etype), "[green]Captured[/green]", time_str)
-    
-    return table
-
-def create_listener_stats_panel():
-    """Create listener statistics panel with debug messages"""
-    stats_info = []
-    stats_info.append(f"[green]Hashes Captured:[/green] {len(UsernamesCaptured)}")
-    stats_info.append(f"[blue]Usernames Seen:[/blue] {len(UsernamesSeen)}")
-    stats_info.append(f"[yellow]Total Users:[/yellow] {len(AllUsernames)}")
-    stats_info.append(f"[cyan]Mode:[/cyan] {mode}")
-    
-    # Add debug messages section
-    if debug_messages:
-        stats_info.append("")
-        stats_info.append("[bold yellow]Recent Debug Messages:[/bold yellow]")
-        for msg in debug_messages[-5:]:  # Show last 5 messages
-            stats_info.append(f"[dim]{msg}[/dim]")
-    
-    panel = Panel(
-        "\n".join(stats_info),
-        title="[bold green]Live Statistics[/bold green]",
-        border_style="green",
-        box=box.ROUNDED
-    )
-    return panel
-
-def create_main_layout():
-    """Create the main display layout"""
-    layout = Layout()
-    
-    # Divide into three main sections
-    layout.split_column(
-        Layout(name="setup", size=8),
-        Layout(name="arp_status", size=8),
-        Layout(name="captures")
-    )
-    
-    # Setup section
-    layout["setup"].update(create_setup_panel())
-    
-    # ARP status section
-    layout["arp_status"].update(create_arp_status_table())
-    
-    # Captures section - split between stats and hash table
-    layout["captures"].split_row(
-        Layout(create_listener_stats_panel(), name="stats", ratio=1),
-        Layout(create_hash_capture_table(), name="hashes", ratio=2)
-    )
-    
-    return layout
-
-def update_live_display():
-    """Update the live display with current information"""
-    global live_display
-    if live_display and setup_complete:
-        layout = create_main_layout()
-        live_display.update(layout)
-
-def start_live_display():
-    """Start the Rich live display"""
-    global live_display
-    if not live_display:
-        layout = create_main_layout()
-        live_display = Live(layout, console=console, refresh_per_second=2, auto_refresh=True)
-        live_display.start()
-
-def stop_live_display():
-    """Stop the Rich live display"""
-    global live_display
-    if live_display:
-        live_display.stop()
-        live_display = None
 
 def print_setup_banner():
     """Print the setup banner using Rich"""
@@ -249,51 +105,37 @@ def print_setup_banner():
 ║                                              Version: 0.0.1                                            ║
 ╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝
     """
-    
-    console.print(Panel(
-        Text(banner_text.strip(), style="bold cyan"),
-        border_style="cyan",
-        box=box.DOUBLE
-    ))
+    console.print(Text(banner_text.strip(), style="bold cyan"))
 
 def rich_print_info(message, style="cyan"):
-    """Print info message using Rich when live display is not active"""
-    if not live_display:
-        console.print(f"[{style}][*][/{style}] {message}")
+    """Print info message using Rich scrolling output"""
+    console.print(f"[{style}][*][/{style}] {message}")
     add_debug_message(f"[INFO] {message}")
 
 def rich_print_success(message):
-    """Print success message using Rich"""
-    if not live_display:
-        console.print(f"[bold green][+][/bold green] {message}")
+    """Print success message using Rich scrolling output"""
+    console.print(f"[bold green][+][/bold green] {message}")
 
 def rich_print_warning(message):
-    """Print warning message using Rich"""
-    if not live_display:
-        console.print(f"[bold yellow][!][/bold yellow] {message}")
+    """Print warning message using Rich scrolling output"""
+    console.print(f"[bold yellow][!][/bold yellow] {message}")
     add_debug_message(f"[WARN] {message}")
 
 def rich_print_error(message):
-    """Print error message using Rich"""
-    if not live_display:
-        console.print(f"[bold red][!][/bold red] {message}")
+    """Print error message using Rich scrolling output"""
+    console.print(f"[bold red][!][/bold red] {message}")
     add_debug_message(f"[ERROR] {message}")
 
 def rich_print_hash(username, domain, etype, hash_string):
-    """Print captured hash with Rich formatting"""
-    # Always print hash captures prominently
-    hash_panel = Panel(
-        f"[bold cyan]Username:[/bold cyan] {username}@{domain}\n"
-        f"[bold yellow]Encryption Type:[/bold yellow] {etype}\n"
-        f"[bold green]Hash:[/bold green] {hash_string}",
-        title="[bold green] HASH CAPTURED! [/bold green]",
-        border_style="green",
-        box=box.DOUBLE
-    )
-    console.print(hash_panel)
-    
-    # Update live display if active
-    update_live_display()
+    """Print captured hash with Rich formatting (scrolling)"""
+    console.print("")
+    console.print(f"[bold green]{'='*60}[/bold green]")
+    console.print(f"[bold green] HASH CAPTURED! [/bold green]")
+    console.print(f"[bold cyan]Username:[/bold cyan] {username}@{domain}")
+    console.print(f"[bold yellow]Encryption Type:[/bold yellow] {etype}")
+    console.print(f"[bold green]Hash:[/bold green] {hash_string}")
+    console.print(f"[bold green]{'='*60}[/bold green]")
+    console.print("")
 
 # =======================================
 # WINDOWS NETWORKING SETUP
@@ -402,9 +244,6 @@ def cleanup_all():
         return
     cleanup_performed = True
     
-    # Stop live display first
-    stop_live_display()
-    
     try:
         # Stop ARP spoofing
         if not disable_spoofing:
@@ -445,8 +284,6 @@ def cleanup_all():
 
 def signal_handler(sig, frame):
     """Handle signals for graceful shutdown."""
-    # Stop live display first
-    stop_live_display()
     
     console.print(f'\n[bold yellow][*][/bold yellow] Received interrupt signal {sig}, cleaning up...')
     if debug:
@@ -468,16 +305,11 @@ def signal_handler(sig, frame):
         # Print final summary if we have captured data
         try:
             if (UsernamesCaptured and len(UsernamesCaptured) > 0) or (UsernamesSeen and len(UsernamesSeen) > 0):
-                summary_panel = Panel(
-                    f"[green]Hashes Captured:[/green] {len(UsernamesCaptured)}\n"
-                    f"[blue]Usernames Seen:[/blue] {len(UsernamesSeen)}\n"
-                    f"[yellow]Output File:[/yellow] {outfile}\n"
-                    f"[cyan]Users File:[/cyan] {usersfile}",
-                    title="[bold green]Session Summary[/bold green]",
-                    border_style="green",
-                    box=box.ROUNDED
-                )
-                console.print(summary_panel)
+                console.print("\n[bold green]Session Summary[/bold green]")
+                console.print(f"[green]Hashes Captured:[/green] {len(UsernamesCaptured)}")
+                console.print(f"[blue]Usernames Seen:[/blue] {len(UsernamesSeen)}")
+                console.print(f"[yellow]Output File:[/yellow] {outfile}")
+                console.print(f"[cyan]Users File:[/cyan] {usersfile}")
         except NameError:
             pass  # Variables might not be initialized yet
         
@@ -599,22 +431,15 @@ def select_interface():
         rich_print_error('No network interfaces found with IPv4 addresses')
         return None
     
-    # Create interface selection table
-    table = Table(title="Available Network Interfaces", box=box.ROUNDED, show_header=True, header_style="bold cyan")
-    table.add_column("ID", style="cyan", no_wrap=True, width=4)
-    table.add_column("Interface Name", style="green", width=25)
-    table.add_column("IP Address", style="yellow", width=15)
-    table.add_column("MAC Address", style="magenta", width=17)
+    # Display interface selection with Rich formatting
+    console.print("\n[bold cyan]Available Network Interfaces:[/bold cyan]")
+    console.print("[cyan]" + "="*80 + "[/cyan]")
     
     for i, iface_info in enumerate(interfaces):
-        table.add_row(
-            str(i+1),
-            iface_info['display_name'],
-            iface_info['ip'],
-            iface_info['mac']
-        )
+        console.print(f"[cyan]{i+1:2}.[/cyan] [green]{iface_info['display_name']:<25}[/green] "
+                     f"[yellow]{iface_info['ip']:<15}[/yellow] [magenta]{iface_info['mac']}[/magenta]")
     
-    console.print(table)
+    console.print("[cyan]" + "="*80 + "[/cyan]")
     
     while True:
         try:
@@ -1790,8 +1615,6 @@ def listen_mode():
             import traceback
             rich_print_info(f'[LISTEN DEBUG] Full traceback: {traceback.format_exc()}', 'cyan')
     finally :
-        # Stop live display before cleanup messages
-        stop_live_display()
         console.print()  # Add newline
         
         # Use centralized cleanup
@@ -1829,9 +1652,6 @@ def relay_mode():
         except ImportError:
             tcp_session_available = False
             rich_print_warning('[TCP SESSION] TCP session support not available - using basic mode')
-        
-        # Update display to show we're now relaying
-        update_live_display()
         
         # Create a threading event to signal when to stop the sniffer
         stop_sniffer = threading.Event()
@@ -1905,8 +1725,6 @@ def relay_mode():
             import traceback
             rich_print_info(f'[RELAY DEBUG] Full traceback: {traceback.format_exc()}', 'cyan')
     finally:
-        # Stop live display before cleanup messages
-        stop_live_display()
         console.print()  # Add newline
         
         # Stop sniffer if it's running
@@ -2345,9 +2163,6 @@ def main():
         if not is_admin():
             rich_print_warning('Not running as Administrator - packet capture may fail!')
     
-    # Start the live display
-    start_live_display()
-
     # Execute the appropriate mode
     try:
         if mode == 'relay' :
@@ -2361,15 +2176,12 @@ def main():
             rich_print_info('Starting listen mode execution...')
             listen_mode()
     except Exception as e:
-        # Stop live display on error
-        stop_live_display()
         rich_print_error(f'Unexpected error during execution: {e}')
         rich_print_warning('Performing emergency cleanup...')
         cleanup_all()
         sys.exit(1)
     finally:
-        # Always stop live display when exiting
-        stop_live_display()
+        pass
 
 if __name__ == '__main__':
     main()
