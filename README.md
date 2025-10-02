@@ -22,7 +22,7 @@ In listen mode, the ARP cache of the gateway is poisoned in order to receive the
 This is a passive mode - there is no alteration of the packets in transit.
 
 ```bash
-python ASRepCatcher-WIN.py listen -dc 192.168.1.100
+python ASRepCatcher-WIN.py listen -t 192.168.1.50 -dc 192.168.1.100
 ```
 
 ### Relay Mode
@@ -32,7 +32,7 @@ In relay mode, ASRepCatcher uses packet sniffing to capture Kerberos authenticat
 **Note**: Unlike the Linux version, the Windows version does not modify Kerberos packets or force RC4 encryption. It only captures the traffic.
 
 ```bash
-python ASRepCatcher-WIN.py relay -dc 192.168.1.100
+python ASRepCatcher-WIN.py relay -t 192.168.1.50 -dc 192.168.1.100
 ```
 
 ## Features of ARP Spoofing
