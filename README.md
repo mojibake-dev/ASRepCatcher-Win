@@ -1,6 +1,6 @@
 # ASRepCatcher-Win - Make everyone in your VLAN ASREProastable
 
-## 🚨 "Works on My Machine" Disclaimer 🚨
+##  "Works on My Machine" Disclaimer 
 
 This Windows version of ASRepCatcher has been tested on a limited number of virtual machines running on an ARM M4 MacBook with only one target node. There is **not** perfect functionality parity between the Linux and Windows versions. Your mileage may vary depending on your specific Windows environment, network configuration, and security settings.
 
